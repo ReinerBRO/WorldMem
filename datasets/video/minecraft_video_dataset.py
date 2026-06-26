@@ -122,12 +122,27 @@ class MinecraftVideoDataset(BaseVideoDataset):
             Tuple[torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]: Video, actions, poses, and timestamps.
         """
         max_retries = 1000
+        start_idx = idx
         for _ in range(max_retries):
             try:
-                return self.load_data(idx)
+                sample = self.load_data(idx)
+                if sample is None:
+                    # Keep moving on when load_data explicitly returns None.
+                    idx = (idx + 1) % len(self)
+                    continue
+
+                if isinstance(sample, tuple) or isinstance(sample, list):
+                    if any(item is None for item in sample):
+                        raise RuntimeError(f"Sample contains None field at idx={idx}")
+
+                if sample is not None:
+                    return sample
             except Exception as e:
                 # print(f"Retrying due to error: {e}")
                 idx = (idx + 1) % len(self)
+        raise RuntimeError(
+            f"Failed to load a valid sample for original index {start_idx} after {max_retries} retries."
+        )
 
     def load_data(self, idx):
         # === 1. Remap index and skip first few frames ===
@@ -145,7 +160,7 @@ class MinecraftVideoDataset(BaseVideoDataset):
         # Fix corrupted height (maybe) in the first frame
         poses_pool[0, 1] = poses_pool[1, 1]
         # assert poses_pool[:, 1].ptp() < 2, f"Height variation too large: {poses_pool[:, 1].ptp()} - {video_path}"
-        assert poses_pool[:, 1].ptp() < 2
+        assert np.ptp(poses_pool[:, 1]) < 2
 
         # Pad poses if shorter than actions
         if len(poses_pool) < len(actions_pool):
@@ -163,6 +178,29 @@ class MinecraftVideoDataset(BaseVideoDataset):
         actions = np.copy(actions_pool[frame_idx : frame_idx + self.n_frames])
         poses = np.copy(poses_pool[frame_idx : frame_idx + self.n_frames])
 
+        if len(video) < self.n_frames:
+            pad_len = self.n_frames - len(video)
+            if len(video) == 0:
+                raise RuntimeError(f"Video clip is empty: {video_path} frame_idx={frame_idx}, n_frames={self.n_frames}")
+            frame_pad = np.repeat(video[-1:], pad_len, axis=0)
+            video = np.concatenate([video, frame_pad], axis=0)
+        if len(actions) < self.n_frames:
+            pad_len = self.n_frames - len(actions)
+            if len(actions) == 0:
+                action_pad = np.zeros((pad_len, actions.shape[-1]), dtype=actions.dtype)
+                actions = np.concatenate([actions, action_pad], axis=0)
+            else:
+                action_pad = np.repeat(actions[-1:], pad_len, axis=0)
+                actions = np.concatenate([actions, action_pad], axis=0)
+        if len(poses) < self.n_frames:
+            pad_len = self.n_frames - len(poses)
+            if len(poses) == 0:
+                pose_pad = np.zeros((pad_len, poses.shape[-1]), dtype=poses.dtype)
+                poses = np.concatenate([poses, pose_pad], axis=0)
+            else:
+                pose_pad = np.repeat(poses[-1:], pad_len, axis=0)
+                poses = np.concatenate([poses, pose_pad], axis=0)
+
         # === 4. Normalize poses relative to current segment ===
         def normalize_pose(pose, ref_pose):
             pose[:, :3] -= ref_pose[:1, :3]
@@ -172,8 +210,6 @@ class MinecraftVideoDataset(BaseVideoDataset):
 
         poses_pool = normalize_pose(poses_pool, poses)
         poses = normalize_pose(poses, poses)
-
-        assert len(video) >= self.n_frames, f"{video_path}"
 
         # === 5. Sample memory frames for training ===
         if self.split == "training" and self.memory_condition_length > 0:

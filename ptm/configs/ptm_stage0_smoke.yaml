@@ -1,0 +1,27 @@
+data:
+  out: ptm_minedojo_data/stage0
+  num_episodes: 100
+  frames_per_episode: 128
+  families: balanced
+  backend: minedojo
+  split: train
+  seed: 0
+  height: 128
+  width: 128
+  history_length: 64
+  future_length: 64
+
+model:
+  memory_dim: 256
+  num_memory_tokens: 16
+  num_layers: 2
+  token_dropout: 0.1
+
+loss:
+  w_embed: 1.0
+  w_loop: 0.5
+  w_match: 0.5
+  w_landmark: 0.5
+  w_object: 0.5
+  lambda_test: 0.25
+  beta_bottleneck: 0.001

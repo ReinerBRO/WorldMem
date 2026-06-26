@@ -16,6 +16,7 @@ python -m main +name=train \
     algorithm.context_frames=600 \
     +algorithm.relative_embedding=true \
     +algorithm.log_video=true \
+    algorithm.video_log_stage=stage3 \
     +algorithm.add_timestamp_embedding=true \
     algorithm.metrics=[lpips,psnr] \
     experiment.training.checkpointing.every_n_train_steps=2500 \

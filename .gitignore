@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+outputs/
+review_bundles/
+tmp/
+.codex_remote_scripts/
+
+.DS_Store
+rikka_xorg_path_redirect.c

@@ -12,6 +12,29 @@ optimizer_beta: [0.9, 0.99]
 action_cond_dim: 25
 use_plucker: true
 
+# PTM integration is off by default to preserve the original WorldMem baseline.
+use_ptm_memory: false
+use_ptm_cross_attention: true
+use_ptm_reference_adapter: false
+video_log_stage: null
+num_memory_tokens: 16
+ptm_memory_dim: 1024
+ptm_num_layers: 4
+ptm_token_dropout: 0.0
+ptm_loss_weight: 0.25
+ptm_bottleneck_weight: 0.001
+ptm_ablation: normal
+ptm_max_history_candidates: 256
+ptm_w_embed: 1.0
+ptm_w_loop: 0.5
+ptm_w_match: 0.5
+ptm_w_landmark: 0.5
+ptm_w_object: 0.5
+generation_target_window_radius: 1
+generation_late_horizon_start: 50
+generation_target_loss_weight: 0.0
+generation_late_loss_weight: 0.0
+
 diffusion:
   # training
   beta_schedule: sigmoid

@@ -155,7 +155,8 @@ class SpatioTemporalDiTBlock(nn.Module):
         relative_embedding=False,
         state_embed_only_on_qk=False,
         use_memory_attention=False,
-        ref_mode='sequential'
+        ref_mode='sequential',
+        use_ptm_cross_attention=False,
     ):
         super().__init__()
         self.is_causal = is_causal
@@ -240,8 +241,42 @@ class SpatioTemporalDiTBlock(nn.Module):
         if self.ref_mode == 'parallel':
             self.parallel_map = nn.Linear(hidden_size, hidden_size)
 
+        self.use_ptm_cross_attention = use_ptm_cross_attention
+        if self.use_ptm_cross_attention:
+            self.ptm_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.ptm_attn = nn.MultiheadAttention(
+                embed_dim=hidden_size,
+                num_heads=num_heads,
+                dropout=0,
+                batch_first=True,
+            )
+            self.ptm_gate = nn.Parameter(torch.full((hidden_size,), 0.1))
+
+    def _apply_ptm_cross_attention(self, x, ptm_memory_tokens=None):
+        if not self.use_ptm_cross_attention or ptm_memory_tokens is None:
+            return x
+
+        B, T, H, W, D = x.shape
+        queries = self.ptm_norm(x.reshape(B, T * H * W, D))
+        attended, _ = self.ptm_attn(
+            queries,
+            ptm_memory_tokens,
+            ptm_memory_tokens,
+            need_weights=False,
+        )
+        attended = attended.reshape(B, T, H, W, D)
+        # Kill-switch 2: force gate scale at eval (env PTM_FORCE_GATE).
+        # None/empty -> use trained tanh(ptm_gate); float -> use that constant.
+        import os as _os
+        _force = _os.environ.get("PTM_FORCE_GATE")
+        if _force is None or _force == "":
+            gate_scale = torch.tanh(self.ptm_gate).view(1, 1, 1, 1, D)
+        else:
+            gate_scale = float(_force)
+        return x + gate_scale * attended
+
     def forward(self, x, c, current_frame=None, timestep=None, is_last_block=False, 
-        pose_cond=None, mode="training", c_action_cond=None, reference_length=None):
+        pose_cond=None, mode="training", c_action_cond=None, reference_length=None, ptm_memory_tokens=None):
         B, T, H, W, D = x.shape
 
         # spatial block
@@ -321,6 +356,8 @@ class SpatioTemporalDiTBlock(nn.Module):
         if self.ref_mode == 'parallel':
             x = x_t + self.parallel_map(x)
 
+        x = self._apply_ptm_cross_attention(x, ptm_memory_tokens)
+
         return x
 
         # print((x1-x2).abs().sum())
@@ -357,7 +394,9 @@ class DiT(nn.Module):
         state_embed_only_on_qk=False,
         use_memory_attention=False,
         add_timestamp_embedding=False,
-        ref_mode='sequential'
+        ref_mode='sequential',
+        use_ptm_cross_attention=False,
+        ptm_memory_dim=1024,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -365,9 +404,15 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.max_frames = max_frames
+        self.use_ptm_cross_attention = use_ptm_cross_attention
 
         self.x_embedder = PatchEmbed(input_h, input_w, patch_size, in_channels, hidden_size, flatten=False)
         self.t_embedder = TimestepEmbedder(hidden_size)
+        self.ptm_memory_proj = (
+            nn.Linear(ptm_memory_dim, hidden_size)
+            if self.use_ptm_cross_attention and ptm_memory_dim != hidden_size
+            else nn.Identity()
+        )
 
         self.add_timestamp_embedding = add_timestamp_embedding
         if self.add_timestamp_embedding:
@@ -406,7 +451,8 @@ class DiT(nn.Module):
                     relative_embedding=relative_embedding,
                     state_embed_only_on_qk=state_embed_only_on_qk,
                     use_memory_attention=use_memory_attention,
-                    ref_mode=ref_mode
+                    ref_mode=ref_mode,
+                    use_ptm_cross_attention=use_ptm_cross_attention,
                 )
                 for _ in range(depth)
             ]
@@ -479,8 +525,8 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward(self, x, t, action_cond=None, pose_cond=None, current_frame=None, mode=None, 
-                    reference_length=None, frame_idx=None):
+    def forward(self, x, t, action_cond=None, pose_cond=None, current_frame=None, mode=None,
+                    reference_length=None, frame_idx=None, ptm_memory_tokens=None):
         """
         Forward pass of DiT.
         x: (B, T, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -536,10 +582,25 @@ class DiT(nn.Module):
                 # pc = pc + rearrange(c_t.clone(), "(b t) d -> b t d", t=T)[:,:,None,None] # add time condition for different timestep scaling 
         else:
             pc = None
+
+        if torch.is_tensor(ptm_memory_tokens):
+            ptm_memory_tokens = ptm_memory_tokens.to(device=x.device, dtype=x.dtype)
+            if ptm_memory_tokens.ndim == 2:
+                ptm_memory_tokens = ptm_memory_tokens.unsqueeze(0)
+            if ptm_memory_tokens.shape[0] == 1 and B > 1:
+                ptm_memory_tokens = ptm_memory_tokens.expand(B, -1, -1)
+            if ptm_memory_tokens.shape[0] != B:
+                raise ValueError(
+                    f"PTM memory batch size {ptm_memory_tokens.shape[0]} does not match DiT batch size {B}"
+                )
+            ptm_memory_tokens = self.ptm_memory_proj(ptm_memory_tokens)
+        else:
+            ptm_memory_tokens = None
         
         for i, block in enumerate(self.blocks):
             x = block(x, c, current_frame=current_frame, timestep=t, is_last_block= (i+1 == len(self.blocks)), 
-                pose_cond=pc, mode=mode, c_action_cond=c_action_cond, reference_length=reference_length)  # (N, T, H, W, D)
+                pose_cond=pc, mode=mode, c_action_cond=c_action_cond, reference_length=reference_length,
+                ptm_memory_tokens=ptm_memory_tokens)  # (N, T, H, W, D)
         x = self.final_layer(x, c) # (N, T, H, W, patch_size ** 2 * out_channels)
         # unpatchify
         x = rearrange(x, "b t h w d -> (b t) h w d")
@@ -551,7 +612,7 @@ class DiT(nn.Module):
 def DiT_S_2(action_cond_dim, pose_cond_dim, reference_length, 
 use_plucker, relative_embedding, 
 state_embed_only_on_qk, use_memory_attention, add_timestamp_embedding,
-ref_mode):
+ref_mode, use_ptm_cross_attention=False, ptm_memory_dim=1024):
     return DiT(
         patch_size=2,
         hidden_size=1024,
@@ -565,7 +626,9 @@ ref_mode):
         state_embed_only_on_qk=state_embed_only_on_qk,
         use_memory_attention=use_memory_attention,
         add_timestamp_embedding=add_timestamp_embedding,
-        ref_mode=ref_mode
+        ref_mode=ref_mode,
+        use_ptm_cross_attention=use_ptm_cross_attention,
+        ptm_memory_dim=ptm_memory_dim,
     )
 
 

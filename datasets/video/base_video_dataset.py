@@ -3,12 +3,22 @@ import torch
 import random
 import os
 import numpy as np
-import cv2
 from omegaconf import DictConfig
 from torchvision import transforms
 from pathlib import Path
 from abc import abstractmethod, ABC
 import json
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - depends on node/system libs.
+    cv2 = None
+
+
+def _require_cv2():
+    if cv2 is None:
+        raise RuntimeError("BaseVideoDataset video/image loading requires opencv-python")
+    return cv2
 
 
 class BaseVideoDataset(torch.utils.data.Dataset, ABC):
@@ -73,9 +83,10 @@ class BaseVideoDataset(torch.utils.data.Dataset, ABC):
 
     def get_data_lengths(self, split):
         """Return a list of num_frames for each data path (e.g. xxx.mp4) for a given split"""
+        cv2_backend = _require_cv2()
         lengths = []
         for path in self.get_data_paths(split):
-            length = cv2.VideoCapture(str(path)).get(cv2.CAP_PROP_FRAME_COUNT)
+            length = cv2_backend.VideoCapture(str(path)).get(cv2_backend.CAP_PROP_FRAME_COUNT)
             lengths.append(length)
         return lengths
 
@@ -92,13 +103,14 @@ class BaseVideoDataset(torch.utils.data.Dataset, ABC):
         :return: video as a numpy array
         """
 
-        cap = cv2.VideoCapture(str(path))
+        cv2_backend = _require_cv2()
+        cap = cv2_backend.VideoCapture(str(path))
 
         frames = []
         while cap.isOpened():
             ret, frame = cap.read()
             if ret:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2_backend.cvtColor(frame, cv2_backend.COLOR_BGR2RGB)
                 frames.append(frame)
             else:
                 break
@@ -114,8 +126,9 @@ class BaseVideoDataset(torch.utils.data.Dataset, ABC):
         :param filename: path to the image
         :return: image as a numpy array
         """
-        image = cv2.imread(str(filename))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        cv2_backend = _require_cv2()
+        image = cv2_backend.imread(str(filename))
+        image = cv2_backend.cvtColor(image, cv2_backend.COLOR_BGR2RGB)
         return np.transpose(image, (2, 0, 1))
 
     def __len__(self):

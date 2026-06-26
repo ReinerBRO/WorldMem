@@ -1,6 +1,7 @@
 from datasets.video import (
     MinecraftVideoDataset
 )
+from ptm.data import PTMWorldMemDataset
 
 from algorithms.worldmem import WorldMemMinecraft
 from .exp_base import BaseLightningExperiment
@@ -18,4 +19,5 @@ class VideoPredictionExperiment(BaseLightningExperiment):
     compatible_datasets = dict(
         # video datasets
         video_minecraft=MinecraftVideoDataset,
+        ptm_minedojo=PTMWorldMemDataset,
     )

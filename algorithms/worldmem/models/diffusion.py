@@ -29,7 +29,9 @@ class Diffusion(nn.Module):
         state_embed_only_on_qk=False,
         use_memory_attention=False,
         add_timestamp_embedding=False,
-        ref_mode='sequential'
+        ref_mode='sequential',
+        use_ptm_cross_attention=False,
+        ptm_memory_dim=1024,
     ):
         super().__init__()
         self.cfg = cfg
@@ -58,6 +60,8 @@ class Diffusion(nn.Module):
         self.use_memory_attention = use_memory_attention
         self.add_timestamp_embedding = add_timestamp_embedding
         self.ref_mode = ref_mode
+        self.use_ptm_cross_attention = use_ptm_cross_attention
+        self.ptm_memory_dim = ptm_memory_dim
 
         self._build_model()
         self._build_buffer()
@@ -72,7 +76,9 @@ class Diffusion(nn.Module):
                                             state_embed_only_on_qk=self.state_embed_only_on_qk,
                                             use_memory_attention=self.use_memory_attention,
                                             add_timestamp_embedding=self.add_timestamp_embedding,
-                                            ref_mode=self.ref_mode)
+                                            ref_mode=self.ref_mode,
+                                            use_ptm_cross_attention=self.use_ptm_cross_attention,
+                                            ptm_memory_dim=self.ptm_memory_dim)
         else:
             raise NotImplementedError
 
@@ -155,8 +161,8 @@ class Diffusion(nn.Module):
     def add_shape_channels(self, x):
         return rearrange(x, f"... -> ...{' 1' * len(self.x_shape)}")
 
-    def model_predictions(self, x, t, action_cond=None, current_frame=None, 
-        pose_cond=None, mode="training", reference_length=None, frame_idx=None):
+    def model_predictions(self, x, t, action_cond=None, current_frame=None,
+        pose_cond=None, mode="training", reference_length=None, frame_idx=None, ptm_memory_tokens=None):
         x = x.permute(1,0,2,3,4)
         action_cond = action_cond.permute(1,0,2)
         if pose_cond is not None and pose_cond[0] is not None:
@@ -166,7 +172,8 @@ class Diffusion(nn.Module):
                 pass
         t = t.permute(1,0)
         model_output = self.model(x, t, action_cond, current_frame=current_frame, pose_cond=pose_cond, 
-            mode=mode, reference_length=reference_length, frame_idx=frame_idx)
+            mode=mode, reference_length=reference_length, frame_idx=frame_idx,
+            ptm_memory_tokens=ptm_memory_tokens)
         model_output = model_output.permute(1,0,2,3,4)
         x = x.permute(1,0,2,3,4)
         t = t.permute(1,0)        
@@ -234,10 +241,22 @@ class Diffusion(nn.Module):
             + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_mean_variance(self, x, t, action_cond=None, pose_cond=None, reference_length=None):
-        model_pred = self.model_predictions(x=x, t=t, action_cond=action_cond, 
+    def p_mean_variance(
+        self,
+        x,
+        t,
+        action_cond=None,
+        pose_cond=None,
+        reference_length=None,
+        frame_idx=None,
+        current_frame=None,
+        mode="training",
+        ptm_memory_tokens=None,
+    ):
+        model_pred = self.model_predictions(x=x, t=t, action_cond=action_cond,
             pose_cond=pose_cond, reference_length=reference_length,
-            frame_idx=frame_idx)
+            frame_idx=frame_idx, current_frame=current_frame, mode=mode,
+            ptm_memory_tokens=ptm_memory_tokens)
         x_start = model_pred.pred_x_start
         return self.q_posterior(x_start=x_start, x_t=x, t=t)
 
@@ -286,15 +305,19 @@ class Diffusion(nn.Module):
         pose_cond,
         noise_levels: torch.Tensor,
         reference_length,
-        frame_idx=None
+        frame_idx=None,
+        ptm_memory_tokens=None,
+        noise: Optional[torch.Tensor] = None,
     ):
-        noise = torch.randn_like(x)
-        noise = torch.clamp(noise, -self.clip_noise, self.clip_noise)
-        
+        if noise is None:
+            noise = torch.randn_like(x)
+            noise = torch.clamp(noise, -self.clip_noise, self.clip_noise)
+
         noised_x = self.q_sample(x_start=x, t=noise_levels, noise=noise)
 
         model_pred = self.model_predictions(x=noised_x, t=noise_levels, action_cond=action_cond, 
-                                    pose_cond=pose_cond,reference_length=reference_length, frame_idx=frame_idx)
+                                    pose_cond=pose_cond,reference_length=reference_length, frame_idx=frame_idx,
+                                    ptm_memory_tokens=ptm_memory_tokens)
 
         pred = model_pred.model_out
         x_pred = model_pred.pred_x_start
@@ -329,7 +352,8 @@ class Diffusion(nn.Module):
         current_frame=None,
         mode="training",
         reference_length=None,
-        frame_idx=None
+        frame_idx=None,
+        ptm_memory_tokens=None,
     ):
         real_steps = torch.linspace(-1, self.timesteps - 1, steps=self.sampling_timesteps + 1, device=x.device).long()
 
@@ -348,7 +372,8 @@ class Diffusion(nn.Module):
                 current_frame=current_frame,
                 mode=mode,
                 reference_length=reference_length,
-                frame_idx=frame_idx
+                frame_idx=frame_idx,
+                ptm_memory_tokens=ptm_memory_tokens,
             )
 
         # FIXME: temporary code for checking ddpm sampling
@@ -367,7 +392,8 @@ class Diffusion(nn.Module):
             curr_noise_level=curr_noise_level,
             guidance_fn=guidance_fn,
             reference_length=reference_length,
-            frame_idx=frame_idx
+            frame_idx=frame_idx,
+            ptm_memory_tokens=ptm_memory_tokens,
         )
 
     def ddpm_sample_step(
@@ -379,6 +405,7 @@ class Diffusion(nn.Module):
         guidance_fn: Optional[Callable] = None,
         reference_length=None,
         frame_idx=None,
+        ptm_memory_tokens=None,
     ):
         clipped_curr_noise_level = torch.where(
             curr_noise_level < 0,
@@ -405,7 +432,8 @@ class Diffusion(nn.Module):
                 action_cond=action_cond,
                 pose_cond=pose_cond,
                 reference_length=reference_length,
-                frame_idx=frame_idx
+                frame_idx=frame_idx,
+                ptm_memory_tokens=ptm_memory_tokens,
             )
 
         noise = torch.where(
@@ -430,7 +458,8 @@ class Diffusion(nn.Module):
         current_frame=None,
         mode="training",
         reference_length=None,
-        frame_idx=None
+        frame_idx=None,
+        ptm_memory_tokens=None,
     ):
         # convert noise level -1 to self.stabilization_level - 1
         clipped_curr_noise_level = torch.where(
@@ -477,7 +506,8 @@ class Diffusion(nn.Module):
                     current_frame=current_frame,
                     mode=mode,
                     reference_length=reference_length,
-                    frame_idx=frame_idx
+                    frame_idx=frame_idx,
+                    ptm_memory_tokens=ptm_memory_tokens,
                 )
 
                 guidance_loss = guidance_fn(model_pred.pred_x_start)
@@ -499,7 +529,8 @@ class Diffusion(nn.Module):
                 current_frame=current_frame,
                 mode=mode,
                 reference_length=reference_length,
-                frame_idx=frame_idx
+                frame_idx=frame_idx,
+                ptm_memory_tokens=ptm_memory_tokens,
             )
             x_start = model_pred.pred_x_start
             pred_noise = model_pred.pred_noise

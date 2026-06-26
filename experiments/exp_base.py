@@ -216,12 +216,13 @@ class BaseLightningExperiment(BaseExperiment):
             False if isinstance(train_dataset, torch.utils.data.IterableDataset) else self.cfg.training.data.shuffle
         )
         if train_dataset:
+            num_workers = min(os.cpu_count(), self.cfg.training.data.num_workers)
             return torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=self.cfg.training.batch_size,
-                num_workers=min(os.cpu_count(), self.cfg.training.data.num_workers),
+                num_workers=num_workers,
                 shuffle=shuffle,
-                persistent_workers=True,
+                persistent_workers=num_workers > 0,
             )
         else:
             return None
@@ -234,12 +235,13 @@ class BaseLightningExperiment(BaseExperiment):
             else self.cfg.validation.data.shuffle
         )
         if validation_dataset:
+            num_workers = min(os.cpu_count(), self.cfg.validation.data.num_workers)
             return torch.utils.data.DataLoader(
                 validation_dataset,
                 batch_size=self.cfg.validation.batch_size,
-                num_workers=min(os.cpu_count(), self.cfg.validation.data.num_workers),
+                num_workers=num_workers,
                 shuffle=shuffle,
-                persistent_workers=True,
+                persistent_workers=num_workers > 0,
             )
         else:
             return None
@@ -248,12 +250,13 @@ class BaseLightningExperiment(BaseExperiment):
         test_dataset = self._build_dataset("test")
         shuffle = False if isinstance(test_dataset, torch.utils.data.IterableDataset) else self.cfg.test.data.shuffle
         if test_dataset:
+            num_workers = min(os.cpu_count(), self.cfg.test.data.num_workers)
             return torch.utils.data.DataLoader(
                 test_dataset,
                 batch_size=self.cfg.test.batch_size,
-                num_workers=min(os.cpu_count(), self.cfg.test.data.num_workers),
+                num_workers=num_workers,
                 shuffle=shuffle,
-                persistent_workers=True,
+                persistent_workers=num_workers > 0,
             )
         else:
             return None
@@ -283,6 +286,7 @@ class BaseLightningExperiment(BaseExperiment):
         trainer = pl.Trainer(
             accelerator="auto",
             devices="auto",
+            num_nodes=self.cfg.num_nodes,
             strategy=DDPStrategy(find_unused_parameters=True) if torch.cuda.device_count() > 1 else "auto",
             logger=self.logger or False,
             callbacks=callbacks,
@@ -345,6 +349,17 @@ class BaseLightningExperiment(BaseExperiment):
                 ckpt_path=self.ckpt_path,
             )
 
+    def _eval_ckpt_path(self, task: str) -> Union[str, pathlib.Path]:
+        if self.customized_load or self.seperate_load or self.zero_init_gate:
+            raise ValueError(
+                f"{task} must load a full Lightning checkpoint through load=<path>. "
+                "customized_load, seperate_load, and zero_init_gate are training-init "
+                "options and are forbidden during evaluation."
+            )
+        if self.ckpt_path is None:
+            raise ValueError(f"{task} requires load=<path-to-lightning-ckpt>.")
+        return self.ckpt_path
+
     def validation(self) -> None:
         """
         All validation happens here
@@ -369,35 +384,11 @@ class BaseLightningExperiment(BaseExperiment):
             inference_mode=self.cfg.validation.inference_mode,
         )
 
-        if self.customized_load:
-            if self.seperate_load:
-                if 'oasis500m' in self.diffusion_model_path:
-                    load_custom_checkpoint(algo=self.algo.diffusion_model.model,checkpoint_path=self.diffusion_model_path)
-                else:
-                    load_custom_checkpoint(algo=self.algo.diffusion_model,checkpoint_path=self.diffusion_model_path)
-                load_custom_checkpoint(algo=self.algo.vae,checkpoint_path=self.vae_path)
-            else:
-                load_custom_checkpoint(algo=self.algo,checkpoint_path=self.ckpt_path)
-
-            if self.zero_init_gate:
-                for name, para in self.algo.diffusion_model.named_parameters():
-                    if 'r_adaLN_modulation' in name:
-                        para.requires_grad_(False)
-                        para[2*1024:3*1024] = 0
-                        para[5*1024:6*1024] = 0
-                        para.requires_grad_(True)
-            
-            trainer.validate(
-                self.algo,
-                dataloaders=self._build_validation_loader(),
-                ckpt_path=None,
-            )
-        else:
-            trainer.validate(
-                self.algo,
-                dataloaders=self._build_validation_loader(),
-                ckpt_path=self.ckpt_path,
-            )
+        trainer.validate(
+            self.algo,
+            dataloaders=self._build_validation_loader(),
+            ckpt_path=self._eval_ckpt_path("validation"),
+        )
 
     def test(self) -> None:
         """
@@ -422,41 +413,11 @@ class BaseLightningExperiment(BaseExperiment):
             detect_anomaly=False,  # self.cfg.debug,
         )
 
-        if self.customized_load:
-            if self.seperate_load:
-                if 'oasis500m' in self.diffusion_model_path:
-                    load_custom_checkpoint(algo=self.algo.diffusion_model.model,checkpoint_path=self.diffusion_model_path)
-                else:
-                    load_custom_checkpoint(algo=self.algo.diffusion_model,checkpoint_path=self.diffusion_model_path)
-                load_custom_checkpoint(algo=self.algo.vae,checkpoint_path=self.vae_path)
-            else:
-                load_custom_checkpoint(algo=self.algo,checkpoint_path=self.ckpt_path)
-
-            if self.zero_init_gate:
-                for name, para in self.algo.diffusion_model.named_parameters():
-                    if 'r_adaLN_modulation' in name:
-                        para.requires_grad_(False)
-                        para[2*1024:3*1024] = 0
-                        para[5*1024:6*1024] = 0
-                        para.requires_grad_(True)
-            
-            trainer.test(
-                self.algo,
-                dataloaders=self._build_test_loader(),
-                ckpt_path=None,
-            )
-        else:
-            trainer.test(
-                self.algo,
-                dataloaders=self._build_test_loader(),
-                ckpt_path=self.ckpt_path,
-            )
-
-
-        if not self.algo:
-            self.algo = self._build_algo()
-        if self.cfg.validation.compile:
-            self.algo = torch.compile(self.algo)
+        trainer.test(
+            self.algo,
+            dataloaders=self._build_test_loader(),
+            ckpt_path=self._eval_ckpt_path("test"),
+        )
 
     def _build_dataset(self, split: str) -> Optional[torch.utils.data.Dataset]:
         if split in ["training", "test", "validation"]:

@@ -5,8 +5,6 @@ import torch
 import os
 
 import matplotlib.pyplot as plt
-import cv2
-import matplotlib.pyplot as plt
 from tqdm import trange, tqdm
 import matplotlib.animation as animation
 from pathlib import Path
@@ -26,6 +24,35 @@ from algorithms.common.metrics import (
 )
 
 
+def _select_video_indices_for_logging(observation_hat_np, observation_gt_np, max_videos):
+    n_samples = len(observation_hat_np)
+    if max_videos is None:
+        return list(range(n_samples))
+
+    n_select = min(n_samples, int(max_videos))
+    if n_select <= 0:
+        return []
+    if observation_gt_np is None:
+        return list(range(n_select))
+
+    pred_first = observation_hat_np[:, 0].astype(np.float32) / 255.0
+    gt_first = observation_gt_np[:, 0].astype(np.float32) / 255.0
+    first_frame_mse = ((pred_first - gt_first) ** 2).mean(axis=(1, 2, 3))
+
+    # Prefer readable surface/land samples for the single W&B thumbnail video.
+    # Metrics still use the full validation batch; this only chooses display media.
+    rgb_mean = gt_first.mean(axis=(2, 3))
+    brightness = rgb_mean.mean(axis=1)
+    red, green, blue = rgb_mean[:, 0], rgb_mean[:, 1], rgb_mean[:, 2]
+    dark_penalty = np.maximum(0.0, 0.28 - brightness)
+    water_penalty = np.maximum(0.0, blue - np.maximum(red, green) - 0.08)
+    red_penalty = np.maximum(0.0, red - np.maximum(green, blue) - 0.10)
+    display_penalty = 0.05 * (dark_penalty + water_penalty + red_penalty)
+
+    scores = first_frame_mse + display_penalty
+    return np.argsort(scores)[:n_select].tolist()
+
+
 # FIXME: clean up & check this util
 def log_video(
     observation_hat,
@@ -40,6 +67,7 @@ def log_video(
     format="mp4",
     save_local=True,
     local_save_dir=None,
+    max_videos=None,
 ):
     """
     take in video tensors in range [-1, 1] and log into wandb
@@ -57,7 +85,6 @@ def log_video(
     :param save_local: whether to save videos to local disk (default: True)
     :param local_save_dir: directory to save local videos. If None, uses hydra output dir
     """
-    import cv2
     import hydra
     from pathlib import Path
     
@@ -79,7 +106,7 @@ def log_video(
     if observation_gt_np is not None:
         observation_gt_np = np.transpose(np.clip(observation_gt_np, a_min=0.0, a_max=1.0) * 255, (1, 0, 2, 3, 4)).astype(np.uint8)
     
-    n_samples = len(observation_hat_np)
+    sample_indices = _select_video_indices_for_logging(observation_hat_np, observation_gt_np, max_videos)
     
     # Setup local save directory
     if save_local:
@@ -105,50 +132,52 @@ def log_video(
             gt_dir.mkdir(parents=True, exist_ok=True)
     
     # Save videos
-    for i in range(n_samples):
-        video_pred = observation_hat_np[i]  # (T, C, H, W)
+    for output_i, sample_i in enumerate(sample_indices):
+        video_pred = observation_hat_np[sample_i]  # (T, C, H, W)
         
         if save_local:
             # Save prediction video
             if step is not None:
-                video_filename_pred = f"{prefix}_{i}_rank{local_rank}_step{step}.{format}"
+                video_filename_pred = f"{prefix}_{output_i}_rank{local_rank}_sample{sample_i}_step{step}.{format}"
             else:
-                video_filename_pred = f"{prefix}_{i}_rank{local_rank}.{format}"
+                video_filename_pred = f"{prefix}_{output_i}_rank{local_rank}_sample{sample_i}.{format}"
             
             video_path_pred = pred_dir / video_filename_pred
             _save_video_to_file(video_pred, str(video_path_pred), fps)
             
             # Save ground truth video if available
             if observation_gt_np is not None:
-                video_gt = observation_gt_np[i]
+                video_gt = observation_gt_np[sample_i]
                 if step is not None:
-                    video_filename_gt = f"{prefix}_{i}_rank{local_rank}_step{step}.{format}"
+                    video_filename_gt = f"{prefix}_{output_i}_rank{local_rank}_sample{sample_i}_step{step}.{format}"
                 else:
-                    video_filename_gt = f"{prefix}_{i}_rank{local_rank}.{format}"
+                    video_filename_gt = f"{prefix}_{output_i}_rank{local_rank}_sample{sample_i}.{format}"
                 
                 video_path_gt = gt_dir / video_filename_gt
                 _save_video_to_file(video_gt, str(video_path_gt), fps)
         
         # Log to wandb (only rank 0 to avoid duplicate logging)
         if local_rank == 0 and logger:
-            # Concatenate pred and gt side by side for visualization
+            # Concatenate pred and gt vertically for visualization.
             if observation_gt_np is not None:
-                video_combined = torch.cat([
-                    torch.from_numpy(observation_hat_np),
-                    torch.from_numpy(observation_gt_np)
-                ], -2).numpy()  # Concatenate along width
+                video_combined = np.concatenate(
+                    [observation_hat_np[sample_i], observation_gt_np[sample_i]],
+                    axis=-2,
+                )
                 logger.log(
                     {
-                        f"{namespace}/{prefix}_{i}": wandb.Video(video_combined[i], fps=fps, format=format),
+                        f"{namespace}/{prefix}_{output_i}": wandb.Video(video_combined, fps=fps, format=format),
                         f"trainer/global_step": step,
-                    }
+                    },
+                    step=step,
                 )
             else:
                 logger.log(
                     {
-                        f"{namespace}/{prefix}_{i}": wandb.Video(video_pred, fps=fps, format=format),
+                        f"{namespace}/{prefix}_{output_i}": wandb.Video(video_pred, fps=fps, format=format),
                         f"trainer/global_step": step,
-                    }
+                    },
+                    step=step,
                 )
 
 

@@ -44,22 +44,6 @@ class SpaceEfficientWandbLogger(WandbLogger):
             name=name,
             save_dir=save_dir,
             version=version,
-            offline=False,
-            dir=dir,
-            id=id,
-            anonymous=anonymous,
-            project=project,
-            log_model=log_model,
-            experiment=experiment,
-            prefix=prefix,
-            checkpoint_name=checkpoint_name,
-            **kwargs,
-        )
-
-        super().__init__(
-            name=name,
-            save_dir=save_dir,
-            version=version,
             offline=offline,
             dir=dir,
             id=id,

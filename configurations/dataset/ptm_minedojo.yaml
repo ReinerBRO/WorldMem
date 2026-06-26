@@ -1,0 +1,21 @@
+defaults:
+  - base_video
+
+save_dir: ptm_minedojo_data/stage0
+ptm_context_length: 4
+ptm_future_length: 4
+n_frames: 8
+future_length: 4
+resolution: [360, 640]
+observation_shape: [3, 360, 640]
+data_mean: 0.5
+data_std: 0.5
+action_cond_dim: 25
+context_length: 4
+frame_skip: 1
+validation_multiplier: 1
+memory_condition_length: 8
+max_history_candidates: 256
+customized_validation: false
+
+_name: ptm_minedojo

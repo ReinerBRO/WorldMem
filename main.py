@@ -59,11 +59,14 @@ def run_local(cfg: DictConfig):
         OmegaConf.set_readonly(hydra_cfg, True)
         
     output_dir = Path(hydra_cfg.runtime.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     if is_rank_zero:
         print(cyan(f"Outputs will be saved to:"), output_dir)
-        (output_dir.parents[1] / "latest-run").unlink(missing_ok=True)
-        (output_dir.parents[1] / "latest-run").symlink_to(output_dir, target_is_directory=True)
+        latest_link = output_dir.parents[1] / "latest-run"
+        tmp_link = latest_link.with_name(f".latest-run.{time.time_ns()}")
+        tmp_link.symlink_to(output_dir, target_is_directory=True)
+        tmp_link.replace(latest_link)
 
     # Set up logging with wandb.
     if cfg.wandb.mode != "disabled":
@@ -77,17 +80,36 @@ def run_local(cfg: DictConfig):
             logger_cls = SpaceEfficientWandbLogger
 
         offline = cfg.wandb.mode != "online"
+        logger_kwargs = {
+            "name": name,
+            "save_dir": str(output_dir),
+            "offline": offline,
+            "entity": cfg.wandb.entity,
+            "project": cfg.wandb.project,
+            "log_model": False,
+            "config": OmegaConf.to_container(cfg),
+        }
+        if resume is not None:
+            logger_kwargs.update(id=resume, resume="auto")
+
         logger = logger_cls(
-            name=name,
-            save_dir=str(output_dir),
-            offline=offline,
-            entity=cfg.wandb.entity,
-            project=cfg.wandb.project,
-            log_model=False,
-            config=OmegaConf.to_container(cfg),
-            id=resume,
-            resume="auto"
+            **logger_kwargs
         )
+        if is_rank_zero and cfg.wandb.mode == "online":
+            experiment = logger.experiment
+            experiment.define_metric("trainer/global_step")
+            for pattern in (
+                "training/*",
+                "validation/*",
+                "generation/*",
+                "test/*",
+                "psnr",
+                "mse",
+                "lpips",
+                "epoch",
+                "lr-*",
+            ):
+                experiment.define_metric(pattern, step_metric="trainer/global_step")
 
     else:
         logger = None
@@ -106,7 +128,7 @@ def run_local(cfg: DictConfig):
     else:
         load_id = None
 
-    if load_id:
+    if load_id and checkpoint_path is None:
         checkpoint_path = get_latest_checkpoint(output_dir / "checkpoints")
     
     if checkpoint_path and is_rank_zero:
