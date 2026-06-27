@@ -9,7 +9,7 @@ fi
 
 cd /gfs/space/private/zjc/ptm
 
-RUN_NAME="${RUN_NAME:-ptm_v5_visual_selector_oasis_10k_$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-ptm_v6_generation_router_oasis_10k_$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-/gfs/space/private/zjc/logs}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${RUN_NAME}}"
 mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
@@ -62,7 +62,11 @@ export PTM_VISUAL_POOL="${PTM_VISUAL_POOL:-grid2x2}"
 export PTM_VISUAL_CANDIDATE_SOURCE="${PTM_VISUAL_CANDIDATE_SOURCE:-context_strided}"
 export PTM_VISUAL_INCLUDE_SUMMARY_TOKENS="${PTM_VISUAL_INCLUDE_SUMMARY_TOKENS:-true}"
 export PTM_VISUAL_REMAP_MATCH_LABELS=true
-export PTM_VISUAL_ROUTING_MODE="${PTM_VISUAL_ROUTING_MODE:-proxy_topk}"
+export PTM_VISUAL_ROUTING_MODE=slot_router
+export PTM_VISUAL_ROUTE_TOP_M="${PTM_VISUAL_ROUTE_TOP_M:-8}"
+export PTM_VISUAL_ROUTE_TAU="${PTM_VISUAL_ROUTE_TAU:-0.2}"
+export PTM_VISUAL_ROUTE_PRIOR_ALPHA="${PTM_VISUAL_ROUTE_PRIOR_ALPHA:-1.0}"
+export PTM_VISUAL_ROUTE_DIM="${PTM_VISUAL_ROUTE_DIM:-0}"
 
 export PTM_TRAIN_CONSUMER_ONLY="${PTM_TRAIN_CONSUMER_ONLY:-false}"
 export PTM_DETACH_FOR_GENERATION=false
@@ -92,10 +96,10 @@ export PTM_PRECISION="${PTM_PRECISION:-16-mixed}"
 export PTM_LOG_VIDEO="${PTM_LOG_VIDEO:-true}"
 export PTM_MAX_LOG_VIDEOS="${PTM_MAX_LOG_VIDEOS:-1}"
 
-echo "[v5] run=${RUN_NAME}"
-echo "[v5] train_cache=${PTM_NPZ_CACHE_DIR}"
-echo "[v5] val_cache=${PTM_NPZ_CACHE_DIR_VAL}"
-echo "[v5] visual_selector=true candidates=${PTM_VISUAL_NUM_CANDIDATES} top_k=${PTM_VISUAL_TOP_K} pool=${PTM_VISUAL_POOL} routing=${PTM_VISUAL_ROUTING_MODE}"
-echo "[v5] clean raw_reference_length=${PTM_RAW_REFERENCE_LENGTH} memory_attention_runtime=${PTM_USE_MEMORY_ATTENTION_RUNTIME}"
+echo "[v6] run=${RUN_NAME}"
+echo "[v6] train_cache=${PTM_NPZ_CACHE_DIR}"
+echo "[v6] val_cache=${PTM_NPZ_CACHE_DIR_VAL}"
+echo "[v6] visual_router=true candidates=${PTM_VISUAL_NUM_CANDIDATES} slots=${PTM_VISUAL_TOP_K} top_m=${PTM_VISUAL_ROUTE_TOP_M} tau=${PTM_VISUAL_ROUTE_TAU} prior_alpha=${PTM_VISUAL_ROUTE_PRIOR_ALPHA} pool=${PTM_VISUAL_POOL}"
+echo "[v6] clean raw_reference_length=${PTM_RAW_REFERENCE_LENGTH} memory_attention_runtime=${PTM_USE_MEMORY_ATTENTION_RUNTIME} train_consumer_only=${PTM_TRAIN_CONSUMER_ONLY}"
 
 exec bash ptm/scripts/train_ptm_main.sh

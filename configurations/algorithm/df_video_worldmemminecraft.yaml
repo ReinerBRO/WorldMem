@@ -40,6 +40,11 @@ ptm_visual_pool: grid2x2
 ptm_visual_candidate_source: context_strided
 ptm_visual_include_summary_tokens: true
 ptm_visual_remap_match_labels: true
+ptm_visual_routing_mode: proxy_topk
+ptm_visual_route_top_m: 8
+ptm_visual_route_tau: 0.2
+ptm_visual_route_prior_alpha: 1.0
+ptm_visual_route_dim: 0
 ptm_ablation: normal
 ptm_max_history_candidates: 256
 ptm_w_embed: 1.0

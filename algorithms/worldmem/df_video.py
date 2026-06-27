@@ -437,6 +437,11 @@ class WorldMemMinecraft(DiffusionForcingBase):
         self.ptm_visual_candidate_source = str(getattr(cfg, "ptm_visual_candidate_source", "context_strided")).strip().lower()
         self.ptm_visual_include_summary_tokens = bool(getattr(cfg, "ptm_visual_include_summary_tokens", True))
         self.ptm_visual_remap_match_labels = bool(getattr(cfg, "ptm_visual_remap_match_labels", True))
+        self.ptm_visual_routing_mode = str(getattr(cfg, "ptm_visual_routing_mode", "proxy_topk")).strip().lower()
+        self.ptm_visual_route_top_m = int(getattr(cfg, "ptm_visual_route_top_m", 8))
+        self.ptm_visual_route_tau = float(getattr(cfg, "ptm_visual_route_tau", 0.2))
+        self.ptm_visual_route_prior_alpha = float(getattr(cfg, "ptm_visual_route_prior_alpha", 1.0))
+        self.ptm_visual_route_dim = int(getattr(cfg, "ptm_visual_route_dim", 0))
         if self.ptm_visual_memory_selection:
             if self.ptm_visual_top_k <= 0:
                 raise ValueError("ptm_visual_top_k must be positive")
@@ -448,6 +453,14 @@ class WorldMemMinecraft(DiffusionForcingBase):
                 raise ValueError(
                     "ptm_visual_candidate_source must be 'batch', 'context_strided', or 'context_recent'"
                 )
+            if self.ptm_visual_routing_mode not in {"proxy_topk", "slot_router"}:
+                raise ValueError("ptm_visual_routing_mode must be 'proxy_topk' or 'slot_router'")
+            if self.ptm_visual_route_top_m <= 0:
+                raise ValueError("ptm_visual_route_top_m must be positive")
+            if self.ptm_visual_route_tau <= 0:
+                raise ValueError("ptm_visual_route_tau must be positive")
+            if self.ptm_visual_route_dim < 0:
+                raise ValueError("ptm_visual_route_dim must be non-negative")
 
         super().__init__(cfg)
 
@@ -559,6 +572,11 @@ class WorldMemMinecraft(DiffusionForcingBase):
                     top_k=self.ptm_visual_top_k,
                     pool=self.ptm_visual_pool,
                     dropout=getattr(self.cfg, "ptm_visual_dropout", 0.0),
+                    routing_mode=self.ptm_visual_routing_mode,
+                    route_top_m=self.ptm_visual_route_top_m,
+                    route_tau=self.ptm_visual_route_tau,
+                    route_prior_alpha=self.ptm_visual_route_prior_alpha,
+                    route_dim=self.ptm_visual_route_dim or None,
                 )
             self.ptm_test_loss = FutureTestLoss(
                 FutureTestLossConfig(
@@ -743,12 +761,23 @@ class WorldMemMinecraft(DiffusionForcingBase):
             labels["test_type_id"],
             candidate_history_embeddings=candidate_embeddings,
         )
-        visual_tokens = self.ptm_visual_selector.selected_visual_tokens(
-            candidate_latents,
-            predictions["match_history_logits"],
-            candidate_mask=candidate_mask.to(memory_tokens.device),
-            top_k=self.ptm_visual_top_k,
-        )
+        candidate_mask = candidate_mask.to(memory_tokens.device)
+        if self.ptm_visual_routing_mode == "slot_router":
+            visual_tokens = self.ptm_visual_selector.routed_visual_tokens(
+                candidate_latents,
+                candidate_embeddings,
+                predictions["match_history_logits"],
+                memory_tokens,
+                candidate_mask=candidate_mask,
+                top_k=self.ptm_visual_top_k,
+            )
+        else:
+            visual_tokens = self.ptm_visual_selector.selected_visual_tokens(
+                candidate_latents,
+                predictions["match_history_logits"],
+                candidate_mask=candidate_mask,
+                top_k=self.ptm_visual_top_k,
+            )
         if self.ptm_visual_include_summary_tokens:
             condition_tokens = torch.cat([memory_tokens, visual_tokens], dim=1)
         else:

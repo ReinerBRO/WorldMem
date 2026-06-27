@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -251,10 +252,12 @@ class FutureSupervisedVisualMemorySelector(nn.Module):
       pools it into one or more visual tokens, and projects those tokens for DiT
       cross-attention.
 
-    Hard top-k indices are chosen from future-supervised scores, while selected
-    token magnitudes are weighted by differentiable softmax probabilities. This
-    keeps diffusion gradients connected to the score logits without turning the
-    memory values into a low-bandwidth summary token.
+    The default proxy_topk path preserves the V5 behavior: hard top-k indices
+    are chosen from future-supervised scores, while selected token magnitudes
+    are weighted by differentiable softmax probabilities. The slot_router path
+    keeps the same visual memory budget but replaces hard membership with
+    sparse differentiable routing slots whose logits combine a generation
+    query with the PTM matched-history prior.
     """
 
     def __init__(
@@ -264,6 +267,11 @@ class FutureSupervisedVisualMemorySelector(nn.Module):
         top_k: int = 8,
         pool: str = "grid2x2",
         dropout: float = 0.0,
+        routing_mode: str = "proxy_topk",
+        route_top_m: int = 8,
+        route_tau: float = 0.2,
+        route_prior_alpha: float = 1.0,
+        route_dim: int | None = None,
     ):
         super().__init__()
         if top_k <= 0:
@@ -271,10 +279,24 @@ class FutureSupervisedVisualMemorySelector(nn.Module):
         pool = str(pool).strip().lower()
         if pool not in {"global", "grid2x2"}:
             raise ValueError("pool must be 'global' or 'grid2x2'")
+        routing_mode = str(routing_mode).strip().lower()
+        if routing_mode not in {"proxy_topk", "slot_router"}:
+            raise ValueError("routing_mode must be 'proxy_topk' or 'slot_router'")
+        if route_top_m <= 0:
+            raise ValueError("route_top_m must be positive")
+        if route_tau <= 0:
+            raise ValueError("route_tau must be positive")
         self.frame_dim = int(frame_dim)
         self.memory_dim = int(memory_dim)
         self.top_k = int(top_k)
         self.pool = pool
+        self.routing_mode = routing_mode
+        self.route_top_m = int(route_top_m)
+        self.route_tau = float(route_tau)
+        self.route_prior_alpha = float(route_prior_alpha)
+        self.route_dim = int(route_dim or memory_dim)
+        if self.route_dim <= 0:
+            raise ValueError("route_dim must be positive")
 
         self.candidate_key_proj = nn.Sequential(
             nn.LayerNorm(frame_dim),
@@ -287,6 +309,16 @@ class FutureSupervisedVisualMemorySelector(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(memory_dim, memory_dim),
         )
+        if self.routing_mode == "slot_router":
+            self.route_query_proj = nn.Sequential(
+                nn.LayerNorm(memory_dim),
+                nn.Linear(memory_dim, self.route_dim),
+            )
+            self.route_key_proj = nn.Sequential(
+                nn.LayerNorm(memory_dim),
+                nn.Linear(memory_dim, self.route_dim),
+            )
+            self.route_slot_embedding = nn.Parameter(torch.randn(self.top_k, self.route_dim) * 0.02)
 
     def _global_candidate_features(self, candidate_latents: torch.Tensor) -> torch.Tensor:
         if candidate_latents.ndim != 5:
@@ -368,3 +400,102 @@ class FutureSupervisedVisualMemorySelector(nn.Module):
             selected_weights = selected_weights[:, :, None].expand(-1, -1, pooled.shape[2]).reshape(batch, -1)
         tokens = tokens * selected_weights[:, :, None].to(tokens.dtype)
         return tokens
+
+    def routed_visual_tokens(
+        self,
+        candidate_latents: torch.Tensor,
+        candidate_embeddings: torch.Tensor,
+        prior_scores: torch.Tensor,
+        memory_tokens: torch.Tensor,
+        candidate_mask: torch.Tensor | None = None,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """Route visual candidates through differentiable budgeted memory slots.
+
+        Each slot sees all K candidates, keeps only its top-m sparse support,
+        and returns the weighted visual value mixture. With grid2x2 pooling this
+        preserves V5's frame budget: top_k routed slots become top_k * 4 visual
+        DiT tokens, just like top_k selected frames in proxy_topk mode.
+        """
+
+        if self.routing_mode != "slot_router":
+            raise ValueError("routed_visual_tokens requires routing_mode='slot_router'")
+        if candidate_latents.ndim != 5:
+            raise ValueError(
+                "candidate_latents must be [B,N,C,H,W], "
+                f"got {tuple(candidate_latents.shape)}"
+            )
+        if candidate_embeddings.ndim != 3:
+            raise ValueError(
+                "candidate_embeddings must be [B,N,D], "
+                f"got {tuple(candidate_embeddings.shape)}"
+            )
+        if prior_scores.ndim != 2:
+            raise ValueError(f"prior_scores must be [B,N], got {tuple(prior_scores.shape)}")
+        if memory_tokens.ndim != 3:
+            raise ValueError(f"memory_tokens must be [B,M,D], got {tuple(memory_tokens.shape)}")
+
+        batch, candidates = prior_scores.shape
+        if candidates <= 0:
+            return candidate_latents.new_zeros(batch, 0, self.memory_dim)
+        if candidate_latents.shape[:2] != (batch, candidates):
+            raise ValueError(
+                "candidate_latents and prior_scores must share [B,N], "
+                f"got {tuple(candidate_latents.shape[:2])} vs {tuple(prior_scores.shape)}"
+            )
+        if candidate_embeddings.shape[:2] != (batch, candidates):
+            raise ValueError(
+                "candidate_embeddings and prior_scores must share [B,N], "
+                f"got {tuple(candidate_embeddings.shape[:2])} vs {tuple(prior_scores.shape)}"
+            )
+        if candidate_embeddings.shape[-1] != self.memory_dim:
+            raise ValueError(
+                f"candidate_embeddings must have dim={self.memory_dim}, "
+                f"got {candidate_embeddings.shape[-1]}"
+            )
+        if memory_tokens.shape[0] != batch or memory_tokens.shape[-1] != self.memory_dim:
+            raise ValueError(
+                "memory_tokens must share batch and memory_dim with candidates, "
+                f"got {tuple(memory_tokens.shape)}"
+            )
+
+        slots = min(int(top_k or self.top_k), int(candidates), int(self.route_slot_embedding.shape[0]))
+        if slots <= 0:
+            return candidate_latents.new_zeros(batch, 0, self.memory_dim)
+        top_m = min(self.route_top_m, candidates)
+
+        safe_mask = None
+        valid_rows = None
+        if candidate_mask is not None:
+            if candidate_mask.shape != prior_scores.shape:
+                raise ValueError(
+                    f"candidate_mask must match prior_scores {tuple(prior_scores.shape)}, "
+                    f"got {tuple(candidate_mask.shape)}"
+                )
+            safe_mask = candidate_mask.to(device=prior_scores.device, dtype=torch.bool).clone()
+            valid_rows = safe_mask.any(dim=1)
+            if not bool(valid_rows.all()):
+                safe_mask[~valid_rows, 0] = True
+
+        pooled = self._pool_visual_values(candidate_latents)
+        patches = int(pooled.shape[2])
+        value_tokens = self.visual_value_proj(pooled.reshape(batch, candidates * patches, pooled.shape[-1]))
+        value_tokens = value_tokens.reshape(batch, candidates, patches, self.memory_dim)
+
+        summary = memory_tokens.mean(dim=1)
+        slot_q = self.route_query_proj(summary)[:, None, :]
+        slot_q = slot_q + self.route_slot_embedding[:slots].to(slot_q.dtype)[None, :, :]
+        cand_k = self.route_key_proj(candidate_embeddings.to(memory_tokens.dtype))
+        route_logits = torch.einsum("bsd,bnd->bsn", slot_q, cand_k) / math.sqrt(float(self.route_dim))
+        route_logits = route_logits + self.route_prior_alpha * prior_scores.to(route_logits.dtype)[:, None, :]
+        if safe_mask is not None:
+            route_logits = route_logits.masked_fill(~safe_mask[:, None, :], torch.finfo(route_logits.dtype).min)
+
+        top_values, top_indices = torch.topk(route_logits, k=top_m, dim=-1)
+        weights = torch.softmax(top_values / self.route_tau, dim=-1)
+        batch_indices = torch.arange(batch, device=value_tokens.device)[:, None, None]
+        gathered_values = value_tokens[batch_indices, top_indices]
+        routed = (weights[:, :, :, None, None].to(gathered_values.dtype) * gathered_values).sum(dim=2)
+        if valid_rows is not None:
+            routed = routed * valid_rows.to(device=routed.device, dtype=routed.dtype)[:, None, None, None]
+        return routed.reshape(batch, slots * patches, self.memory_dim)
