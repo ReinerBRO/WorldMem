@@ -1,19 +1,25 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 export WANDB_API_KEY=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
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-cd /gfs/space/private/zjc/ptm
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
-/gfs/space/private/zjc/envs/worldmem/bin/python -m main \
-  +name=ptm_v3_encoder_coupled_15k \
-  +output_dir=outputs/ptm_v3_encoder_coupled_15k \
+cd /gfs/space/private/zjc/ptm
+RUN_NAME="${RUN_NAME:-ptm_free_generation_baseline_15k_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="outputs/${RUN_NAME}"
+LOG_DIR="/gfs/space/private/zjc/logs"
+mkdir -p "${LOG_DIR}" "${OUTPUT_DIR}"
+export WORLDMEM_LOCAL_LOSS_LOG="${WORLDMEM_LOCAL_LOSS_LOG:-${LOG_DIR}/${RUN_NAME}_local_loss.log}"
+
+exec /gfs/space/private/zjc/envs/worldmem/bin/python -m main \
+  +name="${RUN_NAME}" \
+  +output_dir="${OUTPUT_DIR}" \
   +diffusion_model_path=/gfs/space/private/zjc/models/oasis-500m/oasis500m.safetensors \
   +vae_path=/gfs/space/private/zjc/models/oasis-500m/vit-l-20.safetensors \
   +customized_load=true +seperate_load=true +zero_init_gate=true \
   dataset=ptm_minedojo \
   dataset.save_dir=ptm_minedojo_data/long_1500_360x640 \
   dataset.n_frames=8 dataset.context_length=4 dataset.future_length=4 \
-  dataset.memory_condition_length=8 dataset.max_history_candidates=16 \
+  dataset.memory_condition_length=0 dataset.max_history_candidates=16 \
   dataset.ptm_context_length=4 dataset.ptm_future_length=4 \
   +dataset.n_frames_valid=700 +dataset.ptm_context_length_valid=600 +dataset.ptm_future_length_valid=100 \
   +dataset.npz_cache_dir=/gfs/space/private/zjc/ptm/ptm_minedojo_data/long_1500_360x640_npz_cache \
@@ -22,19 +28,19 @@ cd /gfs/space/private/zjc/ptm
   +dataset.video_cache_size=0 \
   algorithm.context_frames=600 algorithm.num_memory_tokens=16 \
   algorithm.x_shape=[3,360,640] ++algorithm.metrics=[lpips,psnr] \
-  ++algorithm.memory_condition_length=8 ++algorithm.use_ptm_memory=true \
-  ++algorithm.use_ptm_reference_adapter=false ++algorithm.use_memory_attention=true \
-  ++algorithm.use_ptm_cross_attention=true \
-  ++algorithm.ptm_loss_weight=0.1 ++algorithm.ptm_bottleneck_weight=0.001 \
+  ++algorithm.memory_condition_length=0 ++algorithm.use_ptm_memory=false \
+  ++algorithm.use_ptm_reference_adapter=false ++algorithm.use_memory_attention=false \
+  ++algorithm.use_ptm_cross_attention=false \
+  ++algorithm.ptm_loss_weight=0.0 ++algorithm.ptm_bottleneck_weight=0.0 \
   ++algorithm.ptm_eval_only=false ++algorithm.ptm_max_history=16 ++algorithm.ptm_max_history_candidates=16 \
   ++algorithm.ptm_detach_for_generation=false \
-  ++algorithm.ptm_contrast_weight=0.05 ++algorithm.ptm_contrast_margin=0.02 \
-  ++algorithm.ptm_train_consumer_only=true \
+  ++algorithm.ptm_contrast_weight=0.0 ++algorithm.ptm_contrast_margin=0.02 \
+  ++algorithm.ptm_train_consumer_only=false \
   ++algorithm.generation_target_loss_weight=1.0 ++algorithm.generation_late_loss_weight=0.5 \
   ++algorithm.generation_target_window_radius=1 ++algorithm.generation_late_horizon_start=50 \
   ++algorithm.log_video=true ++algorithm.max_log_videos=1 \
-  ++algorithm.validation_ablation_modes=[normal,zero,hard_shuffle] \
-  ++algorithm.local_save_dir="outputs/ptm_v3_encoder_coupled_15k" \
+  ++algorithm.validation_ablation_modes=[normal] \
+  ++algorithm.local_save_dir="${OUTPUT_DIR}" \
   experiment.tasks=[training] \
   experiment.training.max_steps=15000 \
   experiment.training.checkpointing.every_n_train_steps=2500 \

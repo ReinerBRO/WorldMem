@@ -5,8 +5,8 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 cd /gfs/space/private/zjc/ptm
 
 /gfs/space/private/zjc/envs/worldmem/bin/python -m main \
-  +name=ptm_v3_encoder_coupled_15k \
-  +output_dir=outputs/ptm_v3_encoder_coupled_15k \
+  +name=ptm_v1_full_contrast_detach_no_memattn_15k_20260626_105120 \
+  +output_dir=outputs/ptm_v1_full_contrast_detach_no_memattn_15k_20260626_105120 \
   +diffusion_model_path=/gfs/space/private/zjc/models/oasis-500m/oasis500m.safetensors \
   +vae_path=/gfs/space/private/zjc/models/oasis-500m/vit-l-20.safetensors \
   +customized_load=true +seperate_load=true +zero_init_gate=true \
@@ -23,18 +23,18 @@ cd /gfs/space/private/zjc/ptm
   algorithm.context_frames=600 algorithm.num_memory_tokens=16 \
   algorithm.x_shape=[3,360,640] ++algorithm.metrics=[lpips,psnr] \
   ++algorithm.memory_condition_length=8 ++algorithm.use_ptm_memory=true \
-  ++algorithm.use_ptm_reference_adapter=false ++algorithm.use_memory_attention=true \
+  ++algorithm.use_ptm_reference_adapter=false ++algorithm.use_memory_attention=false \
   ++algorithm.use_ptm_cross_attention=true \
   ++algorithm.ptm_loss_weight=0.1 ++algorithm.ptm_bottleneck_weight=0.001 \
   ++algorithm.ptm_eval_only=false ++algorithm.ptm_max_history=16 ++algorithm.ptm_max_history_candidates=16 \
-  ++algorithm.ptm_detach_for_generation=false \
+  ++algorithm.ptm_detach_for_generation=true \
   ++algorithm.ptm_contrast_weight=0.05 ++algorithm.ptm_contrast_margin=0.02 \
   ++algorithm.ptm_train_consumer_only=true \
   ++algorithm.generation_target_loss_weight=1.0 ++algorithm.generation_late_loss_weight=0.5 \
   ++algorithm.generation_target_window_radius=1 ++algorithm.generation_late_horizon_start=50 \
   ++algorithm.log_video=true ++algorithm.max_log_videos=1 \
   ++algorithm.validation_ablation_modes=[normal,zero,hard_shuffle] \
-  ++algorithm.local_save_dir="outputs/ptm_v3_encoder_coupled_15k" \
+  ++algorithm.local_save_dir="outputs/ptm_v1_full_contrast_detach_no_memattn_15k_20260626_105120" \
   experiment.tasks=[training] \
   experiment.training.max_steps=15000 \
   experiment.training.checkpointing.every_n_train_steps=2500 \

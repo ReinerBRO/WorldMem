@@ -24,7 +24,13 @@ from .models.vae import VAE_models
 from .models.diffusion import Diffusion
 from .models.pose_prediction import PosePredictionNet
 from ptm.losses import FutureTestLoss, FutureTestLossConfig
-from ptm.memory import BottleneckLoss, FutureTestDecoder, PTMWorldMemAdapter, PredictiveTestMemory
+from ptm.memory import (
+    BottleneckLoss,
+    FutureSupervisedVisualMemorySelector,
+    FutureTestDecoder,
+    PTMWorldMemAdapter,
+    PredictiveTestMemory,
+)
 import glob
 
 # Utility Functions
@@ -386,14 +392,25 @@ class WorldMemMinecraft(DiffusionForcingBase):
         self.validation_log_step = None if validation_log_step is None else int(validation_log_step)
         self.ptm_eval_outputs = {}
         self.ptm_context_memory_only = bool(getattr(cfg, "ptm_context_memory_only", False))
+        self.ptm_train_context_memory_only = bool(getattr(cfg, "ptm_train_context_memory_only", False))
+        self.ptm_train_context_token_source = str(
+            getattr(cfg, "ptm_train_context_token_source", "reference_tail")
+        ).strip().lower()
         self.ptm_context_memory_strategy = str(getattr(cfg, "ptm_context_memory_strategy", "strided")).strip().lower()
-        if self.ptm_context_memory_only:
+        if self.ptm_train_context_token_source not in {"reference_tail", "context"}:
+            raise ValueError("ptm_train_context_token_source must be 'reference_tail' or 'context'")
+        if self.ptm_context_memory_only or self.ptm_train_context_memory_only:
             if self.raw_reference_length != 0:
-                raise ValueError("ptm_context_memory_only requires raw_reference_length=0")
+                raise ValueError("PTM context-memory-only modes require raw_reference_length=0")
             if self.use_memory_attention_runtime:
-                raise ValueError("ptm_context_memory_only requires use_memory_attention_runtime=false")
+                raise ValueError("PTM context-memory-only modes require use_memory_attention_runtime=false")
+            if self.use_ptm_reference_adapter:
+                raise ValueError("PTM context-memory-only modes require use_ptm_reference_adapter=false")
             if self.ptm_context_memory_strategy not in {"strided", "recent"}:
                 raise ValueError("ptm_context_memory_strategy must be 'strided' or 'recent'")
+        if self.ptm_train_context_memory_only:
+            if not self.use_ptm_memory:
+                raise ValueError("ptm_train_context_memory_only requires use_ptm_memory=true")
         self.generation_target_window_radius = int(getattr(cfg, "generation_target_window_radius", 5))
         self.generation_late_horizon_start = int(getattr(cfg, "generation_late_horizon_start", 50))
         self.generation_target_loss_weight = float(getattr(cfg, "generation_target_loss_weight", 0.0))
@@ -411,6 +428,26 @@ class WorldMemMinecraft(DiffusionForcingBase):
         # DiT (ptm_memory_proj / ptm_norm / ptm_attn / ptm_gate) plus the PTM
         # encoder and test decoder. Protects WorldMem generation capability.
         self.ptm_train_consumer_only = bool(getattr(cfg, "ptm_train_consumer_only", False))
+        self.ptm_visual_memory_selection = bool(getattr(cfg, "ptm_visual_memory_selection", False)) and self.use_ptm_memory
+        self.ptm_visual_top_k = int(getattr(cfg, "ptm_visual_top_k", 8))
+        self.ptm_visual_num_candidates = int(
+            getattr(cfg, "ptm_visual_num_candidates", getattr(cfg, "ptm_max_history_candidates", self.n_frames))
+        )
+        self.ptm_visual_pool = str(getattr(cfg, "ptm_visual_pool", "grid2x2")).strip().lower()
+        self.ptm_visual_candidate_source = str(getattr(cfg, "ptm_visual_candidate_source", "context_strided")).strip().lower()
+        self.ptm_visual_include_summary_tokens = bool(getattr(cfg, "ptm_visual_include_summary_tokens", True))
+        self.ptm_visual_remap_match_labels = bool(getattr(cfg, "ptm_visual_remap_match_labels", True))
+        if self.ptm_visual_memory_selection:
+            if self.ptm_visual_top_k <= 0:
+                raise ValueError("ptm_visual_top_k must be positive")
+            if self.ptm_visual_num_candidates <= 0:
+                raise ValueError("ptm_visual_num_candidates must be positive")
+            if self.ptm_visual_pool not in {"global", "grid2x2"}:
+                raise ValueError("ptm_visual_pool must be 'global' or 'grid2x2'")
+            if self.ptm_visual_candidate_source not in {"batch", "context_strided", "context_recent"}:
+                raise ValueError(
+                    "ptm_visual_candidate_source must be 'batch', 'context_strided', or 'context_recent'"
+                )
 
         super().__init__(cfg)
 
@@ -515,6 +552,14 @@ class WorldMemMinecraft(DiffusionForcingBase):
                 future_embedding_dim=self.vae.latent_dim,
                 max_history_candidates=getattr(self.cfg, "ptm_max_history_candidates", self.n_frames),
             )
+            if self.ptm_visual_memory_selection:
+                self.ptm_visual_selector = FutureSupervisedVisualMemorySelector(
+                    frame_dim=self.vae.latent_dim,
+                    memory_dim=self.ptm_memory_dim,
+                    top_k=self.ptm_visual_top_k,
+                    pool=self.ptm_visual_pool,
+                    dropout=getattr(self.cfg, "ptm_visual_dropout", 0.0),
+                )
             self.ptm_test_loss = FutureTestLoss(
                 FutureTestLossConfig(
                     w_embed=getattr(self.cfg, "ptm_w_embed", 1.0),
@@ -545,6 +590,8 @@ class WorldMemMinecraft(DiffusionForcingBase):
             params += list(self.ptm_memory.parameters())
             if self.use_ptm_reference_adapter:
                 params += list(self.ptm_worldmem_adapter.parameters())
+            if self.ptm_visual_memory_selection:
+                params += list(self.ptm_visual_selector.parameters())
             params += list(self.ptm_test_decoder.parameters())
         optimizer_dynamics = torch.optim.AdamW(
             params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay, betas=self.cfg.optimizer_beta
@@ -562,6 +609,159 @@ class WorldMemMinecraft(DiffusionForcingBase):
             "memory_labels": batch["memory_labels"],
             "target_frames": batch["target_frames"],
         }
+
+    def _visual_candidate_indices(
+        self,
+        xs: torch.Tensor,
+        batch: dict | None,
+        recent_end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return candidate local indices as [N,B] plus valid mask [B,N]."""
+        batch_size = xs.shape[1]
+        device = xs.device
+        max_candidates = max(1, int(self.ptm_visual_num_candidates))
+        recent_end = max(0, min(int(recent_end), int(xs.shape[0])))
+
+        if (
+            self.ptm_visual_candidate_source == "batch"
+            and isinstance(batch, dict)
+            and "candidate_history_indices" in batch
+        ):
+            candidate = batch["candidate_history_indices"]
+            if not torch.is_tensor(candidate):
+                candidate = torch.as_tensor(candidate)
+            candidate = candidate.to(device=device, dtype=torch.long)
+            if candidate.ndim == 1:
+                candidate = candidate[None].expand(batch_size, -1)
+            elif candidate.ndim == 2 and candidate.shape[0] != batch_size and candidate.shape[1] == batch_size:
+                candidate = candidate.transpose(0, 1)
+            if candidate.ndim != 2 or candidate.shape[0] != batch_size:
+                raise ValueError(
+                    "candidate_history_indices must be [B,N] or [N,B], "
+                    f"got {tuple(candidate.shape)} for batch_size={batch_size}"
+                )
+            candidate = candidate[:, :max_candidates].clamp(min=0, max=max(0, xs.shape[0] - 1))
+            counts = batch.get("candidate_history_count") if isinstance(batch, dict) else None
+            if counts is None:
+                counts = torch.full((batch_size,), candidate.shape[1], device=device, dtype=torch.long)
+            elif torch.is_tensor(counts):
+                counts = counts.to(device=device, dtype=torch.long).flatten()
+            else:
+                counts = torch.as_tensor(counts, device=device, dtype=torch.long).flatten()
+            if counts.numel() == 1 and batch_size > 1:
+                counts = counts.expand(batch_size)
+            counts = counts[:batch_size].clamp(min=0, max=candidate.shape[1])
+            positions = torch.arange(candidate.shape[1], device=device)[None]
+            mask = positions < counts[:, None]
+            return candidate.transpose(0, 1).contiguous(), mask
+
+        if recent_end <= 0:
+            candidate = torch.zeros((1, batch_size), device=device, dtype=torch.long)
+            mask = torch.zeros((batch_size, 1), device=device, dtype=torch.bool)
+            return candidate, mask
+
+        count = min(max_candidates, recent_end)
+        if self.ptm_visual_candidate_source == "context_recent":
+            base = torch.arange(recent_end - count, recent_end, device=device, dtype=torch.long)
+        else:
+            base = torch.linspace(0, recent_end - 1, steps=count, device=device).round().to(torch.long)
+        candidate = base[:, None].expand(-1, batch_size).contiguous()
+        mask = torch.ones((batch_size, candidate.shape[0]), device=device, dtype=torch.bool)
+        return candidate, mask
+
+    def _visual_candidate_latents(self, xs: torch.Tensor, candidate_indices: torch.Tensor) -> torch.Tensor:
+        candidate_latents = self._gather_time_batch(xs, candidate_indices)
+        return candidate_latents.permute(1, 0, 2, 3, 4).contiguous().to(self.device)
+
+    def _visual_labels_for_candidates(
+        self,
+        labels: dict[str, torch.Tensor],
+        candidate_indices: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        batch: dict | None,
+    ) -> dict[str, torch.Tensor]:
+        if not self.ptm_visual_remap_match_labels:
+            return labels
+        if not isinstance(batch, dict) or "timestamp" not in batch or "matched_history_t" not in batch:
+            return labels
+        timestamp = batch["timestamp"]
+        if not torch.is_tensor(timestamp):
+            timestamp = torch.as_tensor(timestamp)
+        timestamp = timestamp.to(device=candidate_indices.device, dtype=torch.long)
+        if timestamp.ndim != 2:
+            return labels
+        if timestamp.shape[0] != candidate_mask.shape[0] and timestamp.shape[1] == candidate_mask.shape[0]:
+            timestamp = timestamp.transpose(0, 1)
+        if timestamp.shape[0] != candidate_mask.shape[0]:
+            return labels
+
+        matched_t = batch["matched_history_t"]
+        if not torch.is_tensor(matched_t):
+            matched_t = torch.as_tensor(matched_t)
+        matched_t = matched_t.to(device=candidate_indices.device, dtype=torch.long).flatten()
+        if matched_t.numel() == 1 and candidate_mask.shape[0] > 1:
+            matched_t = matched_t.expand(candidate_mask.shape[0])
+        if matched_t.numel() != candidate_mask.shape[0]:
+            return labels
+
+        local = candidate_indices.transpose(0, 1).clamp(min=0, max=timestamp.shape[1] - 1)
+        candidate_times = timestamp.gather(dim=1, index=local)
+        valid_target = matched_t[:, None] >= 0
+        matches = (candidate_times == matched_t[:, None]) & candidate_mask & valid_target
+        remapped = dict(labels)
+        match_valid = matches.any(dim=1)
+        remapped["matched_history_index"] = torch.where(
+            match_valid,
+            matches.to(torch.float32).argmax(dim=1).to(torch.long),
+            torch.zeros_like(matched_t, dtype=torch.long),
+        )
+        remapped["match_valid"] = match_valid
+        return remapped
+
+    def _build_visual_condition_tokens(
+        self,
+        memory_tokens: torch.Tensor,
+        xs: torch.Tensor,
+        batch: dict | None,
+        ptm_supervision: dict | None,
+        recent_end: int,
+    ) -> tuple[torch.Tensor, dict | None]:
+        if not self.ptm_visual_memory_selection or memory_tokens is None:
+            return memory_tokens, None
+        if ptm_supervision is None:
+            raise ValueError("ptm_visual_memory_selection requires future_actions/memory_labels in the batch")
+
+        candidate_indices, candidate_mask = self._visual_candidate_indices(xs, batch, recent_end)
+        candidate_latents = self._visual_candidate_latents(xs, candidate_indices)
+        candidate_embeddings = self.ptm_visual_selector.candidate_embeddings(candidate_latents)
+        labels = self._normalize_ptm_labels(ptm_supervision["memory_labels"], memory_tokens.device)
+        labels = self._visual_labels_for_candidates(labels, candidate_indices, candidate_mask, batch)
+        future_actions = ptm_supervision["future_actions"].to(memory_tokens.device)
+        predictions = self.ptm_test_decoder(
+            memory_tokens,
+            future_actions,
+            labels["test_type_id"],
+            candidate_history_embeddings=candidate_embeddings,
+        )
+        visual_tokens = self.ptm_visual_selector.selected_visual_tokens(
+            candidate_latents,
+            predictions["match_history_logits"],
+            candidate_mask=candidate_mask.to(memory_tokens.device),
+            top_k=self.ptm_visual_top_k,
+        )
+        if self.ptm_visual_include_summary_tokens:
+            condition_tokens = torch.cat([memory_tokens, visual_tokens], dim=1)
+        else:
+            condition_tokens = visual_tokens
+        aux = {
+            "candidate_embeddings": candidate_embeddings,
+            "candidate_indices": candidate_indices,
+            "candidate_mask": candidate_mask,
+            "predictions": predictions,
+            "labels": labels,
+            "visual_tokens": visual_tokens,
+        }
+        return condition_tokens, aux
 
     def _batch_has_reference_tail(self, batch) -> bool:
         if not isinstance(batch, dict) or "has_reference_tail" not in batch:
@@ -772,6 +972,57 @@ class WorldMemMinecraft(DiffusionForcingBase):
             order.append(candidates[i % len(candidates)])
         return torch.tensor(order, dtype=torch.long, device=device)
 
+    def _validation_shuffle_tokens_by_episode(
+        self,
+        tokens: torch.Tensor,
+        batch: dict | None,
+    ) -> torch.Tensor:
+        """Shuffle token conditioning using different episodes across the DDP global batch."""
+        if tokens.shape[0] <= 1:
+            raise ValueError("PTM shuffle_token validation requires batch_size > 1")
+        episode_ids = batch.get("episode_id") if isinstance(batch, dict) else None
+        if episode_ids is None:
+            episode_dirs = batch.get("episode_dir") if isinstance(batch, dict) else None
+            episode_families = batch.get("episode_family") if isinstance(batch, dict) else None
+            order = self._hard_shuffle_order(tokens.shape[0], tokens.device, episode_dirs, episode_families)
+            return tokens[order]
+        episode_ids = torch.as_tensor(episode_ids, dtype=torch.long, device=tokens.device)
+        if episode_ids.numel() != tokens.shape[0]:
+            raise ValueError(
+                f"episode_id batch size {episode_ids.numel()} does not match token batch size {tokens.shape[0]}"
+            )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            rank = torch.distributed.get_rank()
+            gathered_tokens = [torch.empty_like(tokens) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_tokens, tokens.contiguous())
+            gathered_episode_ids = [torch.empty_like(episode_ids) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_episode_ids, episode_ids.contiguous())
+            all_tokens = torch.cat(gathered_tokens, dim=0)
+            all_episode_ids = torch.cat(gathered_episode_ids, dim=0)
+            local_batch = tokens.shape[0]
+            selected = []
+            for local_idx in range(local_batch):
+                global_idx = rank * local_batch + local_idx
+                candidates = torch.nonzero(all_episode_ids != episode_ids[local_idx], as_tuple=False).flatten()
+                if candidates.numel() == 0:
+                    raise ValueError("PTM shuffle_token validation requires at least two episodes in the DDP batch")
+                selected.append(candidates[global_idx % candidates.numel()])
+            selected_indices = torch.stack(selected).to(tokens.device)
+            return all_tokens.index_select(0, selected_indices)
+
+        candidates_by_item = []
+        for item_episode in episode_ids:
+            candidates = torch.nonzero(episode_ids != item_episode, as_tuple=False).flatten()
+            if candidates.numel() == 0:
+                raise ValueError("PTM shuffle_token validation requires at least two episodes in the batch")
+            candidates_by_item.append(candidates)
+        selected = [
+            candidates[int(local_idx) % candidates.numel()]
+            for local_idx, candidates in enumerate(candidates_by_item)
+        ]
+        return tokens.index_select(0, torch.stack(selected).to(tokens.device))
+
     def _apply_ptm_input_ablation(
         self,
         xs: torch.Tensor,
@@ -942,18 +1193,35 @@ class WorldMemMinecraft(DiffusionForcingBase):
         self,
         memory_tokens: torch.Tensor,
         ptm_supervision: dict,
+        candidate_history_embeddings: torch.Tensor | None = None,
+        labels_override: dict[str, torch.Tensor] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        labels = self._normalize_ptm_labels(ptm_supervision["memory_labels"], memory_tokens.device)
+        labels = labels_override or self._normalize_ptm_labels(ptm_supervision["memory_labels"], memory_tokens.device)
         future_actions = ptm_supervision["future_actions"].to(memory_tokens.device)
-        predictions = self.ptm_test_decoder(memory_tokens, future_actions, labels["test_type_id"])
+        predictions = self.ptm_test_decoder(
+            memory_tokens,
+            future_actions,
+            labels["test_type_id"],
+            candidate_history_embeddings=candidate_history_embeddings,
+        )
         return predictions, labels
 
     def _compute_ptm_test_loss(
         self,
         memory_tokens: torch.Tensor,
         ptm_supervision: dict,
+        visual_aux: dict | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        predictions, labels = self._ptm_predictions(memory_tokens, ptm_supervision)
+        if visual_aux is not None and "predictions" in visual_aux and "labels" in visual_aux:
+            predictions = visual_aux["predictions"]
+            labels = visual_aux["labels"]
+        else:
+            predictions, labels = self._ptm_predictions(
+                memory_tokens,
+                ptm_supervision,
+                candidate_history_embeddings=visual_aux.get("candidate_embeddings") if visual_aux else None,
+                labels_override=visual_aux.get("labels") if visual_aux else None,
+            )
         target_frames = ptm_supervision["target_frames"].to(memory_tokens.device)
         target_latents = self.encode(target_frames.unsqueeze(0)).squeeze(0)
         target_embeddings = target_latents.mean(dim=(-2, -1))
@@ -1035,7 +1303,18 @@ class WorldMemMinecraft(DiffusionForcingBase):
             )
             if memory_tokens is None:
                 return
-            predictions, labels = self._ptm_predictions(memory_tokens, ptm_supervision)
+            if self.ptm_visual_memory_selection:
+                _, visual_aux = self._build_visual_condition_tokens(
+                    memory_tokens,
+                    xs,
+                    batch,
+                    ptm_supervision,
+                    recent_end,
+                )
+                predictions = visual_aux["predictions"]
+                labels = visual_aux["labels"]
+            else:
+                predictions, labels = self._ptm_predictions(memory_tokens, ptm_supervision)
 
             target_frames = ptm_supervision["target_frames"].to(memory_tokens.device)
             target_latents = self.encode(target_frames.unsqueeze(0)).squeeze(0)
@@ -1563,51 +1842,83 @@ class WorldMemMinecraft(DiffusionForcingBase):
             dict: A dictionary containing the training loss.
         """
         ptm_supervision = self._extract_ptm_supervision(batch)
+        batch_dict = batch if isinstance(batch, dict) else None
+        batch_has_ref_tail = bool(self.memory_condition_length) and self._batch_has_reference_tail(batch_dict)
+        batch_memory_length = self._batch_int(batch_dict, "memory_condition_length", 0)
+        if batch_has_ref_tail and batch_memory_length != int(self.memory_condition_length):
+            raise ValueError(
+                f"batch memory_condition_length={batch_memory_length}, "
+                f"but algorithm memory_condition_length={self.memory_condition_length}"
+            )
+        tail_length = batch_memory_length if batch_has_ref_tail else 0
+        train_reference_length = (
+            tail_length
+            if batch_has_ref_tail and not self.ptm_train_context_memory_only
+            else 0
+        )
         xs, conditions, pose_conditions, c2w_mat, frame_idx = self._preprocess_batch(batch)
+        main_frame_count = xs.shape[0] - tail_length if batch_has_ref_tail else xs.shape[0]
+        if main_frame_count <= 0:
+            raise ValueError(f"invalid training main_frame_count={main_frame_count} for xs length {xs.shape[0]}")
+        diffusion_input_length = main_frame_count + train_reference_length
+        reference_c2w = c2w_mat[main_frame_count:main_frame_count + train_reference_length]
+        reference_frame_idx = frame_idx[main_frame_count:main_frame_count + train_reference_length]
 
         if self.use_plucker:
             if self.relative_embedding:
                 input_pose_condition = []
                 frame_idx_list = []
-                for i in range(self.n_frames):
+                for i in range(main_frame_count):
+                    pose_parts = [c2w_mat[i:i + 1]]
+                    frame_parts = [frame_idx[i:i + 1] - frame_idx[i:i + 1]]
+                    if train_reference_length:
+                        pose_parts.append(reference_c2w)
+                        frame_parts.append(reference_frame_idx - frame_idx[i:i + 1])
                     input_pose_condition.append(
                         convert_to_plucker(
-                            torch.cat([c2w_mat[i:i + 1], c2w_mat[-self.memory_condition_length:]]).clone(),
+                            torch.cat(pose_parts).clone(),
                             0,
                             focal_length=self.focal_length,
                             image_height=xs.shape[-2],image_width=xs.shape[-1]
                         ).to(xs.dtype)
                     )
-                    frame_idx_list.append(
-                        torch.cat([
-                            frame_idx[i:i + 1] - frame_idx[i:i + 1],
-                            frame_idx[-self.memory_condition_length:] - frame_idx[i:i + 1]
-                        ]).clone()
-                    )
+                    frame_idx_list.append(torch.cat(frame_parts).clone())
                 input_pose_condition = torch.cat(input_pose_condition)
                 frame_idx_list = torch.cat(frame_idx_list)
             else:
                 input_pose_condition = convert_to_plucker(
-                    c2w_mat, 0, focal_length=self.focal_length
+                    c2w_mat[:diffusion_input_length], 0, focal_length=self.focal_length
                 ).to(xs.dtype)
-                frame_idx_list = frame_idx
+                frame_idx_list = frame_idx[:diffusion_input_length]
         else:
-            input_pose_condition = pose_conditions.to(xs.dtype)
+            input_pose_condition = pose_conditions[:diffusion_input_length].to(xs.dtype)
             frame_idx_list = None
 
-        batch_dict = batch if isinstance(batch, dict) else None
         xs = self.encode(xs)
-        encoded_xs = xs
-        has_ref_tail = bool(self.memory_condition_length) and self._batch_has_reference_tail(batch_dict)
-        train_reference_length = self.memory_condition_length if has_ref_tail else 0
+        encoded_xs_full = xs
+        conditions_full = conditions
+        pose_conditions_full = pose_conditions
         ptm_memory_tokens = None
+        ptm_visual_aux = None
+        recent_end = None
         if self.use_ptm_memory:
-            selected_indices = self._reference_tail_indices(xs, batch_dict)
-            recent_end = self._recent_end_from_batch(xs, batch_dict)
+            recent_end = self._recent_end_from_batch(encoded_xs_full, batch_dict)
+            use_context_token_source = (
+                self.ptm_train_context_memory_only
+                and (self.ptm_train_context_token_source == "context" or not batch_has_ref_tail)
+            )
+            if use_context_token_source:
+                selected_indices = self._context_memory_indices(
+                    recent_end,
+                    encoded_xs_full.shape[1],
+                    encoded_xs_full.device,
+                )
+            else:
+                selected_indices = self._reference_tail_indices(encoded_xs_full, batch_dict)
             ptm_memory_tokens = self._encode_ptm_memory_input(
-                xs,
-                conditions,
-                pose_conditions,
+                encoded_xs_full,
+                conditions_full,
+                pose_conditions_full,
                 selected_indices,
                 0,
                 recent_end,
@@ -1620,10 +1931,20 @@ class WorldMemMinecraft(DiffusionForcingBase):
         # non-detached tokens.
         ptm_condition_tokens = None
         if ptm_memory_tokens is not None:
-            ptm_condition_tokens = ptm_memory_tokens.detach() if self.ptm_detach_for_generation else ptm_memory_tokens
+            ptm_condition_tokens, ptm_visual_aux = self._build_visual_condition_tokens(
+                ptm_memory_tokens,
+                encoded_xs_full,
+                batch_dict,
+                ptm_supervision,
+                int(recent_end),
+            )
+            ptm_condition_tokens = ptm_condition_tokens.detach() if self.ptm_detach_for_generation else ptm_condition_tokens
+        xs = encoded_xs_full[:diffusion_input_length]
+        conditions = conditions_full[:diffusion_input_length]
+        pose_conditions = pose_conditions_full[:diffusion_input_length]
         normal_conditions = conditions.clone()
         xs, conditions, ptm_memory_tokens = self._apply_ptm_memory_references(
-            encoded_xs,
+            xs,
             normal_conditions,
             pose_conditions,
             ptm_memory_tokens,
@@ -1694,7 +2015,7 @@ class WorldMemMinecraft(DiffusionForcingBase):
             loss = loss + self.ptm_contrast_weight * contrast_loss
 
         if self.use_ptm_memory and ptm_supervision is not None and self.ptm_loss_weight > 0:
-            ptm_loss, ptm_components = self._compute_ptm_test_loss(ptm_memory_tokens, ptm_supervision)
+            ptm_loss, ptm_components = self._compute_ptm_test_loss(ptm_memory_tokens, ptm_supervision, ptm_visual_aux)
             loss = loss + self.ptm_loss_weight * ptm_loss
             if batch_idx % 20 == 0:
                 self.log("training/ptm_future_test_loss", ptm_components["future_tests_unweighted"].detach().cpu())
@@ -1704,6 +2025,11 @@ class WorldMemMinecraft(DiffusionForcingBase):
             self.log("training/diffusion_loss", diffusion_loss.detach().cpu())
             if contrast_loss is not None:
                 self.log("training/ptm_contrast_loss", contrast_loss.detach().cpu())
+            if ptm_visual_aux is not None:
+                self.log(
+                    "training/ptm_visual_tokens",
+                    torch.as_tensor(ptm_visual_aux["visual_tokens"].shape[1], dtype=torch.float32),
+                )
             if generation_loss_weight is not None:
                 self.log("training/generation_weight_mean", generation_loss_weight.detach().mean().cpu())
                 self.log("training/generation_weight_max", generation_loss_weight.detach().max().cpu())
@@ -2091,6 +2417,7 @@ class WorldMemMinecraft(DiffusionForcingBase):
         else:
             xs = self.encode(xs_raw).cpu()
 
+        ptm_supervision = self._extract_ptm_supervision(batch)
         original_mode = self.ptm_ablation
         try:
             if self.ptm_eval_only:
@@ -2156,7 +2483,7 @@ class WorldMemMinecraft(DiffusionForcingBase):
                 curr_frame += n_context_frames
                 pbar = tqdm(total=n_frames, initial=curr_frame, desc=f"Sampling/{mode}")
                 context_ptm_tokens = None
-                if self.ptm_context_memory_only and self.use_ptm_memory:
+                if self.ptm_context_memory_only and self.use_ptm_memory and not self.ptm_visual_memory_selection:
                     context_selected = self._context_memory_indices(
                         n_context_frames,
                         batch_size,
@@ -2186,6 +2513,8 @@ class WorldMemMinecraft(DiffusionForcingBase):
 
                     random_idx = np.zeros((0, batch_size), dtype=np.int64)
                     ptm_sampling_tokens = None
+                    ptm_visual_source_xs = None
+                    ptm_visual_recent_end = None
                     effective_reference_length = 0
                     if memory_condition_length:
                         if use_reference_tail:
@@ -2210,8 +2539,28 @@ class WorldMemMinecraft(DiffusionForcingBase):
                                     memory_condition_length + curr_frame,
                                     batch,
                                 )
+                                ptm_visual_source_xs = ptm_source_xs
+                                ptm_visual_recent_end = memory_condition_length + curr_frame
                         elif self.ptm_context_memory_only:
-                            ptm_sampling_tokens = context_ptm_tokens
+                            if self.use_ptm_memory and self.ptm_visual_memory_selection:
+                                context_selected = self._context_memory_indices(
+                                    curr_frame,
+                                    batch_size,
+                                    xs_pred.device,
+                                )
+                                ptm_sampling_tokens = self._encode_ptm_memory_input(
+                                    xs_pred,
+                                    conditions_main,
+                                    pose_conditions_main,
+                                    context_selected,
+                                    0,
+                                    curr_frame,
+                                    batch,
+                                )
+                                ptm_visual_source_xs = xs_pred
+                                ptm_visual_recent_end = curr_frame
+                            else:
+                                ptm_sampling_tokens = context_ptm_tokens
                         else:
                             random_idx = self._generate_condition_indices(
                                 curr_frame,
@@ -2235,6 +2584,8 @@ class WorldMemMinecraft(DiffusionForcingBase):
                                 curr_frame,
                                 batch,
                             )
+                            ptm_visual_source_xs = xs_pred
+                            ptm_visual_recent_end = curr_frame
 
                     input_condition, input_pose_condition, frame_idx_list = self._prepare_conditions(
                         start_frame,
@@ -2261,17 +2612,26 @@ class WorldMemMinecraft(DiffusionForcingBase):
                         )
                         xs_pred[-effective_reference_length:] = ref_latents.detach().cpu()
 
+                    if (
+                        self.ptm_visual_memory_selection
+                        and ptm_sampling_tokens is not None
+                        and ptm_visual_source_xs is not None
+                        and ptm_visual_recent_end is not None
+                    ):
+                        ptm_sampling_tokens, _ = self._build_visual_condition_tokens(
+                            ptm_sampling_tokens,
+                            ptm_visual_source_xs,
+                            batch,
+                            ptm_supervision,
+                            int(ptm_visual_recent_end),
+                        )
+
                     # Kill-switch 1: token-level ablation on ptm_sampling_tokens.
                     token_mode = self._canonical_ablation_mode(self.ptm_ablation)
                     if ptm_sampling_tokens is not None and token_mode == "zero_token":
                         ptm_sampling_tokens = torch.zeros_like(ptm_sampling_tokens)
                     elif ptm_sampling_tokens is not None and token_mode == "shuffle_token":
-                        episode_dirs = batch.get("episode_dir") if isinstance(batch, dict) else None
-                        episode_families = batch.get("episode_family") if isinstance(batch, dict) else None
-                        order = self._hard_shuffle_order(
-                            ptm_sampling_tokens.shape[0], ptm_sampling_tokens.device, episode_dirs, episode_families
-                        )
-                        ptm_sampling_tokens = ptm_sampling_tokens[order]
+                        ptm_sampling_tokens = self._validation_shuffle_tokens_by_episode(ptm_sampling_tokens, batch)
 
                     for m in range(scheduling_matrix.shape[0] - 1):
                         from_noise_levels, to_noise_levels = self._prepare_noise_levels(

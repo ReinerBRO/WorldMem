@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .bottleneck import TokenDropout
 
@@ -236,3 +237,134 @@ class FutureTestDecoder(nn.Module):
             "object_exists_logit": self.object_exists_head(state).squeeze(-1),
             "memory_attention": attn_weights,
         }
+
+
+class FutureSupervisedVisualMemorySelector(nn.Module):
+    """Selects high-bandwidth visual memory values from historical latent candidates.
+
+    The selector deliberately separates "which candidate is future-relevant" from
+    "what the candidate looks like":
+
+    - candidate_embeddings() projects each candidate latent to the PTM memory space
+      for the future-test matched-history classifier.
+    - selected_visual_tokens() keeps the selected candidate's visual latent content,
+      pools it into one or more visual tokens, and projects those tokens for DiT
+      cross-attention.
+
+    Hard top-k indices are chosen from future-supervised scores, while selected
+    token magnitudes are weighted by differentiable softmax probabilities. This
+    keeps diffusion gradients connected to the score logits without turning the
+    memory values into a low-bandwidth summary token.
+    """
+
+    def __init__(
+        self,
+        frame_dim: int,
+        memory_dim: int = 1024,
+        top_k: int = 8,
+        pool: str = "grid2x2",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        pool = str(pool).strip().lower()
+        if pool not in {"global", "grid2x2"}:
+            raise ValueError("pool must be 'global' or 'grid2x2'")
+        self.frame_dim = int(frame_dim)
+        self.memory_dim = int(memory_dim)
+        self.top_k = int(top_k)
+        self.pool = pool
+
+        self.candidate_key_proj = nn.Sequential(
+            nn.LayerNorm(frame_dim),
+            nn.Linear(frame_dim, memory_dim),
+        )
+        self.visual_value_proj = nn.Sequential(
+            nn.LayerNorm(frame_dim),
+            nn.Linear(frame_dim, memory_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(memory_dim, memory_dim),
+        )
+
+    def _global_candidate_features(self, candidate_latents: torch.Tensor) -> torch.Tensor:
+        if candidate_latents.ndim != 5:
+            raise ValueError(
+                "candidate_latents must be [B,N,C,H,W], "
+                f"got {tuple(candidate_latents.shape)}"
+            )
+        return candidate_latents.mean(dim=(-2, -1))
+
+    def candidate_embeddings(self, candidate_latents: torch.Tensor) -> torch.Tensor:
+        features = self._global_candidate_features(candidate_latents)
+        return self.candidate_key_proj(features)
+
+    def _pool_visual_values(self, candidate_latents: torch.Tensor) -> torch.Tensor:
+        batch, candidates, channels, height, width = candidate_latents.shape
+        flat = candidate_latents.reshape(batch * candidates, channels, height, width)
+        if self.pool == "global":
+            pooled = flat.mean(dim=(-2, -1)).reshape(batch, candidates, 1, channels)
+        else:
+            pooled = F.adaptive_avg_pool2d(flat, output_size=(2, 2))
+            pooled = pooled.permute(0, 2, 3, 1).reshape(batch, candidates, 4, channels)
+        return pooled
+
+    def selected_visual_tokens(
+        self,
+        candidate_latents: torch.Tensor,
+        scores: torch.Tensor,
+        candidate_mask: torch.Tensor | None = None,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        if candidate_latents.ndim != 5:
+            raise ValueError(
+                "candidate_latents must be [B,N,C,H,W], "
+                f"got {tuple(candidate_latents.shape)}"
+            )
+        if scores.ndim != 2:
+            raise ValueError(f"scores must be [B,N], got {tuple(scores.shape)}")
+        batch, candidates = scores.shape
+        if candidate_latents.shape[:2] != (batch, candidates):
+            raise ValueError(
+                "candidate_latents and scores must share [B,N], "
+                f"got {tuple(candidate_latents.shape[:2])} vs {tuple(scores.shape)}"
+            )
+        if candidates <= 0:
+            return candidate_latents.new_zeros(batch, 0, self.memory_dim)
+
+        k = min(int(top_k or self.top_k), int(candidates))
+        masked_scores = scores
+        if candidate_mask is not None:
+            if candidate_mask.shape != scores.shape:
+                raise ValueError(
+                    f"candidate_mask must match scores {tuple(scores.shape)}, got {tuple(candidate_mask.shape)}"
+                )
+            # Keep at least one finite entry per sample to avoid NaNs on
+            # degenerate padded batches; invalid-only rows select index 0 but
+            # then get zero weights from the mask below.
+            has_valid = candidate_mask.any(dim=1)
+            safe_mask = candidate_mask.clone()
+            if not bool(has_valid.all()):
+                safe_mask[~has_valid, 0] = True
+            masked_scores = scores.masked_fill(~safe_mask, torch.finfo(scores.dtype).min)
+
+        top_indices = torch.topk(masked_scores, k=k, dim=1).indices
+        gather_shape = (batch, k, *candidate_latents.shape[2:])
+        gather_indices = top_indices[:, :, None, None, None].expand(gather_shape)
+        selected_latents = candidate_latents.gather(dim=1, index=gather_indices)
+
+        pooled = self._pool_visual_values(selected_latents)
+        tokens = self.visual_value_proj(pooled.reshape(batch, k * pooled.shape[2], pooled.shape[-1]))
+
+        probs = torch.softmax(masked_scores, dim=1)
+        selected_weights = probs.gather(dim=1, index=top_indices)
+        if candidate_mask is not None:
+            selected_valid = candidate_mask.gather(dim=1, index=top_indices).to(selected_weights.dtype)
+            selected_weights = selected_weights * selected_valid
+        selected_weights = selected_weights / selected_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        selected_weights = selected_weights * float(k)
+        if pooled.shape[2] > 1:
+            selected_weights = selected_weights[:, :, None].expand(-1, -1, pooled.shape[2]).reshape(batch, -1)
+        tokens = tokens * selected_weights[:, :, None].to(tokens.dtype)
+        return tokens

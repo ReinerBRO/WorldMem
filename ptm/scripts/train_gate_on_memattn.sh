@@ -1,10 +1,6 @@
 #!/bin/bash
 set -e
-export WANDB_API_KEY="${WANDB_API_KEY:-$(cat /gfs/space/private/zjc/.secrets/wandb_api_key 2>/dev/null || true)}"
-if [[ -z "${WANDB_API_KEY}" ]]; then
-  echo "WANDB_API_KEY is not set and /gfs/space/private/zjc/.secrets/wandb_api_key is missing" >&2
-  exit 2
-fi
+export WANDB_API_KEY=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
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 cd /gfs/space/private/zjc/ptm
 

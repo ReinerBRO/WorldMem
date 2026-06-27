@@ -4,8 +4,10 @@ set -euo pipefail
 : "${PTM_CKPT:?set PTM_CKPT}"
 PTM_FORMAL_NPZ_CACHE_DIR="/gfs/space/private/zjc/ptm/ptm_minedojo_data/gen600x100_npz_cache"
 PTM_NPZ_CACHE_DIR="${PTM_NPZ_CACHE_DIR:-${PTM_FORMAL_NPZ_CACHE_DIR}}"
-if [[ "${PTM_NPZ_CACHE_DIR}" != "${PTM_FORMAL_NPZ_CACHE_DIR}" ]]; then
+PTM_ALLOW_NONFORMAL_NPZ_CACHE="${PTM_ALLOW_NONFORMAL_NPZ_CACHE:-false}"
+if [[ "${PTM_NPZ_CACHE_DIR}" != "${PTM_FORMAL_NPZ_CACHE_DIR}" && "${PTM_ALLOW_NONFORMAL_NPZ_CACHE}" != "true" ]]; then
   echo "refusing non-formal PTM_NPZ_CACHE_DIR=${PTM_NPZ_CACHE_DIR}; expected ${PTM_FORMAL_NPZ_CACHE_DIR}" >&2
+  echo "set PTM_ALLOW_NONFORMAL_NPZ_CACHE=true only for explicit external-dataset diagnostics" >&2
   exit 2
 fi
 
@@ -17,6 +19,7 @@ PTM_GENERATION_BATCH_SIZE="${PTM_GENERATION_BATCH_SIZE:-2}"
 PTM_GENERATION_LIMIT_BATCH="${PTM_GENERATION_LIMIT_BATCH:-1}"
 PTM_GENERATION_NUM_WORKERS="${PTM_GENERATION_NUM_WORKERS:-0}"
 PTM_NPZ_CACHE_SPLIT="${PTM_NPZ_CACHE_SPLIT:-test}"
+PTM_SHARD_INDICES_DIR="${PTM_SHARD_INDICES_DIR:-}"
 PTM_CONTEXT_MEMORY_ONLY="${PTM_CONTEXT_MEMORY_ONLY:-false}"
 PTM_CONTEXT_MEMORY_STRATEGY="${PTM_CONTEXT_MEMORY_STRATEGY:-strided}"
 PTM_GPU_LIST="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -53,6 +56,13 @@ PTM_USE_MEMORY_ATTENTION="${PTM_USE_MEMORY_ATTENTION:-true}"
 PTM_USE_MEMORY_ATTENTION_RUNTIME="${PTM_USE_MEMORY_ATTENTION_RUNTIME:-false}"
 PTM_USE_PTM_CROSS_ATTENTION="${PTM_USE_PTM_CROSS_ATTENTION:-true}"
 PTM_USE_PTM_REFERENCE_ADAPTER="${PTM_USE_PTM_REFERENCE_ADAPTER:-false}"
+PTM_VISUAL_MEMORY_SELECTION="${PTM_VISUAL_MEMORY_SELECTION:-false}"
+PTM_VISUAL_TOP_K="${PTM_VISUAL_TOP_K:-8}"
+PTM_VISUAL_NUM_CANDIDATES="${PTM_VISUAL_NUM_CANDIDATES:-${PTM_MAX_HISTORY_CANDIDATES}}"
+PTM_VISUAL_POOL="${PTM_VISUAL_POOL:-grid2x2}"
+PTM_VISUAL_CANDIDATE_SOURCE="${PTM_VISUAL_CANDIDATE_SOURCE:-context_strided}"
+PTM_VISUAL_INCLUDE_SUMMARY_TOKENS="${PTM_VISUAL_INCLUDE_SUMMARY_TOKENS:-true}"
+PTM_VISUAL_REMAP_MATCH_LABELS="${PTM_VISUAL_REMAP_MATCH_LABELS:-true}"
 
 if [[ "${PTM_CONTEXT_MEMORY_ONLY}" == "true" ]]; then
   if [[ "${PTM_RAW_REFERENCE_LENGTH}" != "0" ]]; then
@@ -114,16 +124,52 @@ fi
 mkdir -p "${PTM_EVAL_ROOT}/logs" "${PTM_EVAL_ROOT}/shard_indices"
 PTM_SUITE_ROOT="${PTM_EVAL_ROOT}"
 
-python - \
-  "${PTM_NPZ_CACHE_DIR}" \
-  "${PTM_NPZ_CACHE_SPLIT}" \
-  "${PTM_EVAL_ROOT}/shard_indices" \
-  "${PTM_NUM_SHARDS}" \
-  "${PTM_GENERATION_BATCH_SIZE}" \
-  "${PTM_REQUIRED_MEMORY_STRATEGY}" \
-  "${PTM_VAL_CONTEXT_LENGTH}" \
-  "${PTM_VAL_FUTURE_LENGTH}" \
-  "${PTM_ABLATIONS}" <<'PY'
+if [[ -n "${PTM_SHARD_INDICES_DIR}" ]]; then
+  if [[ ! -f "${PTM_SHARD_INDICES_DIR}/plan.json" ]]; then
+    echo "PTM_SHARD_INDICES_DIR=${PTM_SHARD_INDICES_DIR} is missing plan.json" >&2
+    exit 1
+  fi
+  for (( shard=0; shard<PTM_NUM_SHARDS; shard++ )); do
+    if [[ ! -f "${PTM_SHARD_INDICES_DIR}/shard${shard}.txt" ]]; then
+      echo "PTM_SHARD_INDICES_DIR=${PTM_SHARD_INDICES_DIR} is missing shard${shard}.txt" >&2
+      exit 1
+    fi
+  done
+  cp "${PTM_SHARD_INDICES_DIR}/plan.json" "${PTM_EVAL_ROOT}/shard_indices/plan.json"
+  for (( shard=0; shard<PTM_NUM_SHARDS; shard++ )); do
+    cp "${PTM_SHARD_INDICES_DIR}/shard${shard}.txt" "${PTM_EVAL_ROOT}/shard_indices/shard${shard}.txt"
+  done
+  python - "${PTM_EVAL_ROOT}/shard_indices" "${PTM_NUM_SHARDS}" "${PTM_GENERATION_BATCH_SIZE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out_dir = Path(sys.argv[1])
+num_shards = int(sys.argv[2])
+batch_size = int(sys.argv[3])
+expected = num_shards * batch_size
+indices = []
+for shard in range(num_shards):
+    path = out_dir / f"shard{shard}.txt"
+    values = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(values) != batch_size:
+        raise SystemExit(f"{path} has {len(values)} samples; expected {batch_size}")
+    indices.extend(values)
+if len(indices) != len(set(indices)):
+    raise SystemExit("prebuilt shard indices contain duplicate sample indices")
+print(json.dumps({"plan": str(out_dir / "plan.json"), "samples": expected, "shards": num_shards}, sort_keys=True), flush=True)
+PY
+else
+  python - \
+    "${PTM_NPZ_CACHE_DIR}" \
+    "${PTM_NPZ_CACHE_SPLIT}" \
+    "${PTM_EVAL_ROOT}/shard_indices" \
+    "${PTM_NUM_SHARDS}" \
+    "${PTM_GENERATION_BATCH_SIZE}" \
+    "${PTM_REQUIRED_MEMORY_STRATEGY}" \
+    "${PTM_VAL_CONTEXT_LENGTH}" \
+    "${PTM_VAL_FUTURE_LENGTH}" \
+    "${PTM_ABLATIONS}" <<'PY'
 import json
 import random
 import sys
@@ -146,7 +192,7 @@ if not manifest_path.exists():
     raise SystemExit(f"missing NPZ cache manifest: {manifest_path}")
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 strategy = manifest.get("memory_strategy")
-if strategy != required_strategy:
+if required_strategy and strategy is not None and strategy != required_strategy:
     raise SystemExit(f"invalid PTM cache memory_strategy={strategy!r}; expected {required_strategy!r}")
 if int(manifest.get("context_length", -1)) != expected_context:
     raise SystemExit(f"generation cache must be context_length={expected_context}; got {manifest.get('context_length')!r}")
@@ -214,6 +260,7 @@ plan_path = out_dir / "plan.json"
 plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(json.dumps({"plan": str(plan_path), "samples": expected, "shards": num_shards}, sort_keys=True), flush=True)
 PY
+fi
 
 run_mode() {
   local mode="$1"
@@ -274,6 +321,13 @@ run_mode() {
         ++algorithm.ptm_context_memory_strategy="${PTM_CONTEXT_MEMORY_STRATEGY}" \
         ++algorithm.ptm_max_history="${PTM_MAX_HISTORY}" \
         ++algorithm.ptm_max_history_candidates="${PTM_MAX_HISTORY_CANDIDATES}" \
+        ++algorithm.ptm_visual_memory_selection="${PTM_VISUAL_MEMORY_SELECTION}" \
+        ++algorithm.ptm_visual_top_k="${PTM_VISUAL_TOP_K}" \
+        ++algorithm.ptm_visual_num_candidates="${PTM_VISUAL_NUM_CANDIDATES}" \
+        ++algorithm.ptm_visual_pool="${PTM_VISUAL_POOL}" \
+        ++algorithm.ptm_visual_candidate_source="${PTM_VISUAL_CANDIDATE_SOURCE}" \
+        ++algorithm.ptm_visual_include_summary_tokens="${PTM_VISUAL_INCLUDE_SUMMARY_TOKENS}" \
+        ++algorithm.ptm_visual_remap_match_labels="${PTM_VISUAL_REMAP_MATCH_LABELS}" \
         ++algorithm.log_video=false \
         ++algorithm.max_log_videos=0 \
         ++algorithm.video_log_stage=ptm \

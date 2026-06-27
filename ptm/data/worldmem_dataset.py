@@ -50,6 +50,9 @@ def _split_names(value: Any) -> set[str]:
     if value is None:
         return {"train"}
     if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            value = value[1:-1]
         return {part.strip() for part in value.split(",") if part.strip()}
     return {str(part).strip() for part in value if str(part).strip()}
 
@@ -163,6 +166,10 @@ class PTMWorldMemDataset(torch.utils.data.Dataset):
                         f"PTM NPZ cache indices out of range for {index_path}: {invalid[:8]}"
                     )
                 self.cache_index = [self.cache_index[index] for index in selected_indices]
+            episode_dirs = sorted({str(entry.get("episode_dir", "")) for entry in self.cache_index})
+            self._cache_episode_to_id = {
+                episode_dir: episode_id for episode_id, episode_dir in enumerate(episode_dirs)
+            }
             self.npz_split_dir = index_path.parent
             self.use_npz_cache = True
             return
@@ -278,6 +285,31 @@ class PTMWorldMemDataset(torch.utils.data.Dataset):
                 cached_timestamp = cached_timestamp[:main_length]
                 memory_condition_length = 0
                 has_reference_tail = False
+            timestamp_values = [int(value) for value in cached_timestamp.detach().cpu().tolist()]
+            timestamp_to_local: dict[int, int] = {}
+            for local_idx, timestamp in enumerate(timestamp_values):
+                timestamp_to_local.setdefault(timestamp, local_idx)
+            if "candidate_history_indices" in data:
+                candidate_abs = [int(value) for value in np.asarray(data["candidate_history_indices"]).reshape(-1)]
+            else:
+                candidate_abs = timestamp_values[:context_length]
+            candidate_local: list[int] = []
+            for value in candidate_abs[: self.max_history_candidates]:
+                if value in timestamp_to_local:
+                    candidate_local.append(timestamp_to_local[value])
+                elif 0 <= value < len(timestamp_values):
+                    # Backward-compatible path for caches that already stored
+                    # local indices instead of absolute frame timestamps.
+                    candidate_local.append(int(value))
+                else:
+                    candidate_local.append(0)
+            candidate_count = min(len(candidate_local), self.max_history_candidates)
+            if not candidate_local:
+                candidate_local = [0]
+                candidate_count = 0
+            if len(candidate_local) < self.max_history_candidates:
+                candidate_local.extend([candidate_local[-1]] * (self.max_history_candidates - len(candidate_local)))
+            candidate_local = candidate_local[: self.max_history_candidates]
             labels = {
                 "test_type_id": torch.tensor(int(data["test_type_id"].item()), dtype=torch.long),
                 "matched_history_index": torch.tensor(int(data["matched_history_index"].item()), dtype=torch.long),
@@ -298,6 +330,10 @@ class PTMWorldMemDataset(torch.utils.data.Dataset):
                 "memory_labels": labels,
                 "test_type": entry.get("test_type", "unknown"),
                 "episode_dir": entry.get("episode_dir", ""),
+                "episode_id": torch.tensor(
+                    int(self._cache_episode_to_id.get(str(entry.get("episode_dir", "")), -1)),
+                    dtype=torch.long,
+                ),
                 "episode_family": entry.get("episode_family", ""),
                 "query_index_in_video": torch.tensor(int(data["query_index_in_video"].item()), dtype=torch.long),
                 "target_index_in_video": torch.tensor(int(data["target_index_in_video"].item()), dtype=torch.long),
@@ -310,6 +346,12 @@ class PTMWorldMemDataset(torch.utils.data.Dataset):
                 ),
                 "ptm_recent_end_index": torch.tensor(int(data["ptm_recent_end_index"].item()), dtype=torch.long),
                 "history_context_end_index": torch.tensor(int(data["history_context_end_index"].item()), dtype=torch.long),
+                "matched_history_t": torch.tensor(
+                    int(data["matched_history_t"].item()) if "matched_history_t" in data else -1,
+                    dtype=torch.long,
+                ),
+                "candidate_history_indices": torch.tensor(candidate_local, dtype=torch.long),
+                "candidate_history_count": torch.tensor(candidate_count, dtype=torch.long),
                 "context_length": torch.tensor(context_length, dtype=torch.long),
                 "future_length": torch.tensor(future_length, dtype=torch.long),
                 "memory_condition_length": torch.tensor(memory_condition_length, dtype=torch.long),
@@ -350,6 +392,7 @@ def collate_worldmem_ptm(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "memory_labels": tensor_labels,
         "test_type": [item["test_type"] for item in batch],
         "episode_dir": [item["episode_dir"] for item in batch],
+        "episode_id": torch.stack([item["episode_id"] for item in batch], dim=0),
         "episode_family": [item.get("episode_family", "") for item in batch],
         "query_index_in_video": torch.stack([item["query_index_in_video"] for item in batch], dim=0),
         "target_index_in_video": torch.stack([item["target_index_in_video"] for item in batch], dim=0),
@@ -362,6 +405,9 @@ def collate_worldmem_ptm(batch: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "ptm_recent_end_index": torch.stack([item["ptm_recent_end_index"] for item in batch], dim=0),
         "history_context_end_index": torch.stack([item["history_context_end_index"] for item in batch], dim=0),
+        "matched_history_t": torch.stack([item["matched_history_t"] for item in batch], dim=0),
+        "candidate_history_indices": torch.stack([item["candidate_history_indices"] for item in batch], dim=0),
+        "candidate_history_count": torch.stack([item["candidate_history_count"] for item in batch], dim=0),
         "context_length": torch.stack([item["context_length"] for item in batch], dim=0),
         "future_length": torch.stack([item["future_length"] for item in batch], dim=0),
         "memory_condition_length": torch.stack([item["memory_condition_length"] for item in batch], dim=0),
